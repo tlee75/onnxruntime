@@ -21,6 +21,8 @@ class Shape : public OpenCLKernel {
   Status Compute(OpKernelContext* ctx) const override {
     const Tensor* X = ctx->Input<Tensor>(0);
     const auto dims = X->Shape().GetDims();
+    LOGS_DEFAULT(ERROR) << "[OCL Shape] rank=" << dims.size()
+                       << " last=" << (dims.empty() ? 0 : dims[dims.size() - 1]);
     Tensor* Y = ctx->Output(0, TensorShape({static_cast<int64_t>(dims.size())}));
     if (!dims.empty()) {
       exec_->WriteToCLBuffer(CL_BUFFER_FROM_TENSOR(*Y), dims.data(),

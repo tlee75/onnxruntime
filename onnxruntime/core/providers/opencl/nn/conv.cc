@@ -22,12 +22,15 @@ class Conv : public OpenCLKernel {
  public:
   explicit Conv(const OpKernelInfo& info) : OpenCLKernel(info) {
     info.GetAttrOrDefault<int64_t>("group", &group_, 1);
-    strides_ = {1};
-    pads_ = {0};
-    dilations_ = {1};
+    // NB: OpKernelInfo::GetAttrs APPENDS to the vector — do NOT pre-fill.
+    strides_.clear();
+    pads_.clear();
+    dilations_.clear();
     (void)info.GetAttrs("strides", strides_);
     (void)info.GetAttrs("pads", pads_);
     (void)info.GetAttrs("dilations", dilations_);
+    if (strides_.empty()) strides_ = {1};
+    if (dilations_.empty()) dilations_ = {1};
     LoadProgram(conv_kernel_src, conv_kernel_src_len);
     LoadKernel("Conv1D_Float");
   }
@@ -48,6 +51,8 @@ class Conv : public OpenCLKernel {
     const int64_t pad_l = pads_.size() > 0 ? pads_[0] : 0;
     const int64_t pad_r = pads_.size() > 1 ? pads_[1] : pad_l;
     const int64_t Wout = (W + pad_l + pad_r - dilation * (K - 1) - 1) / stride + 1;
+    LOGS_DEFAULT(ERROR) << "[OCL Conv] in=" << W << " K=" << K << " stride=" << stride
+                       << " pad=" << pad_l << " -> out=" << Wout;
     Tensor* Y = context->Output(0, TensorShape({N, M, Wout}));
 
     cl_mem bias = (B != nullptr) ? CL_BUFFER_FROM_TENSOR(*B) : CL_BUFFER_FROM_TENSOR(*X);

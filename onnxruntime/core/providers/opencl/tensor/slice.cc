@@ -7,6 +7,10 @@
 #include "core/providers/cpu/tensor/slice.h"
 #include "core/providers/cpu/tensor/slice_helper.h"
 #include "core/providers/cpu/tensor/utils.h"
+
+#include <cstring>
+
+#include "core/framework/ortdevice.h"
 namespace onnxruntime {
 namespace opencl {
 
@@ -79,8 +83,29 @@ template <bool dynamic>
 Status Slice<dynamic>::FillInputVectors(OpKernelContext* ctx, TensorShapeVector& input_starts,
                                         TensorShapeVector& input_ends, TensorShapeVector& input_axes,
                                         TensorShapeVector& input_steps) const {
-  return FillVectorsFromInput(*ctx->Input<Tensor>(1), *ctx->Input<Tensor>(2), ctx->Input<Tensor>(3),
-                              ctx->Input<Tensor>(4), input_starts, input_ends, input_axes, input_steps);
+  // starts/ends/axes/steps are produced by the shape sub-graph, which runs on
+  // THIS (GPU) EP. ORT inserts no host<->device copies for this EP, so read
+  // them from wherever they actually live (a cl_mem on the GPU, or host memory)
+  // instead of assuming a CPU copy exists.
+  auto read_i64 = [&](int idx, TensorShapeVector& out) -> Status {
+    const Tensor* t = ctx->Input<Tensor>(idx);
+    if (t == nullptr) return Status::OK();
+    const int64_t n = t->Shape().Size();
+    out.resize(static_cast<size_t>(n));
+    if (n == 0) return Status::OK();
+    const size_t bytes = static_cast<size_t>(n) * sizeof(int64_t);
+    if (t->Location().device.Type() == OrtDevice::GPU) {
+      exec_->ReadFromCLBuffer(CL_BUFFER_FROM_TENSOR(*t), out.data(), bytes);
+    } else {
+      std::memcpy(out.data(), t->DataRaw(), bytes);
+    }
+    return Status::OK();
+  };
+  ORT_RETURN_IF_ERROR(read_i64(1, input_starts));
+  ORT_RETURN_IF_ERROR(read_i64(2, input_ends));
+  ORT_RETURN_IF_ERROR(read_i64(3, input_axes));
+  ORT_RETURN_IF_ERROR(read_i64(4, input_steps));
+  return Status::OK();
 }
 template <bool dynamic>
 Status Slice<dynamic>::Compute(OpKernelContext* ctx) const {
@@ -94,6 +119,14 @@ Status Slice<dynamic>::Compute(OpKernelContext* ctx) const {
   TensorShapeVector input_starts, input_ends, input_axes, input_steps;
   if (dynamic) {
     ORT_RETURN_IF_ERROR(FillInputVectors(ctx, input_starts, input_ends, input_axes, input_steps));
+    {
+      std::ostringstream os;
+      os << "[OCL Slice inputs] starts=";
+      for (auto v : input_starts) os << v << ",";
+      os << " ends=";
+      for (auto v : input_ends) os << v << ",";
+      LOGS_DEFAULT(ERROR) << os.str();
+    }
     ORT_RETURN_IF_ERROR(PrepareForCompute(input_starts, input_ends, input_axes, input_steps, compute_metadata));
 
   } else {
@@ -102,6 +135,9 @@ Status Slice<dynamic>::Compute(OpKernelContext* ctx) const {
   }
 
   TensorShape output_shape(compute_metadata.output_dims_);
+  LOGS_DEFAULT(ERROR) << "[OCL Slice] in last="
+                     << input_shape.GetDims().back() << " out last="
+                     << (compute_metadata.output_dims_.empty() ? 0 : compute_metadata.output_dims_.back());
   auto* output_tensor = ctx->Output(0, output_shape);
   if (output_shape.Size() == 0) {
     return Status::OK();
@@ -156,10 +192,6 @@ Status Slice<dynamic>::Compute(OpKernelContext* ctx) const {
       TIND,                                                             \
       kOpenCLExecutionProvider,                                         \
       (*KernelDefBuilder::Create())                                     \
-          .InputMemoryType(OrtMemTypeCPUInput, 1)                       \
-          .InputMemoryType(OrtMemTypeCPUInput, 2)                       \
-          .InputMemoryType(OrtMemTypeCPUInput, 3)                       \
-          .InputMemoryType(OrtMemTypeCPUInput, 4)                       \
           .TypeConstraint("T", DataTypeImpl::AllFixedSizeTensorTypes()) \
           .TypeConstraint("Tind", DataTypeImpl::GetTensorType<TIND>()), \
       Slice<true>);
