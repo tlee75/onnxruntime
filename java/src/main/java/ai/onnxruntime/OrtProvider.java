@@ -44,7 +44,9 @@ public enum OrtProvider {
   /** The QNN execution provider. */
   QNN("QNNExecutionProvider"),
   /** The WebGPU execution provider */
-  WEBGPU("WebGpuExecutionProvider");
+  WEBGPU("WebGpuExecutionProvider"),
+  /** The OpenCL execution provider (mobile GPU). */
+  OPENCL("OpenCLExecutionProvider");
 
   private static final Map<String, OrtProvider> valueMap = new HashMap<>(values().length);
 
