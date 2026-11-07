@@ -10,6 +10,7 @@
 #include "core/framework/kernel_registry.h"
 #include "core/framework/op_kernel.h"
 
+#include <algorithm>
 #include <array>
 #include <string>
 #include <unordered_set>
@@ -158,13 +159,32 @@ Status RegisterOpenCLKernels(KernelRegistry& kernel_registry) {
 
   };
 
+  // This EP keeps tensors on the GPU and does NOT handle host<->device copies
+  // (ORT's MemcpyTransformer inserts none for it). So it must not claim ops
+  // whose shape/index inputs are CPU-resident, or the op reads a host pointer
+  // as a cl_mem. The shape ops (Shape/Gather/Unsqueeze/Squeeze/Reshape) are left
+  // to the CPU EP — ORT's own shape-op policy — and the int64/int32 shape
+  // arithmetic stays on the CPU too. Only the float data-path ops are claimed.
+  static const std::unordered_set<std::string> shape_ops = {
+      "Shape", "Gather", "Unsqueeze", "Squeeze", "Reshape"};
+  static const std::unordered_set<std::string> elem_ops = {
+      "Add", "Sub", "Mul", "Div"};
+  auto is_float_only = [](const KernelDef& def) {
+    auto it = def.TypeConstraints().find("T");
+    if (it == def.TypeConstraints().end()) return true;
+    return std::all_of(it->second.begin(), it->second.end(),
+                       [](MLDataType t) { return t == DataTypeImpl::GetTensorType<float>(); });
+  };
+
   for (auto& function_table_entry : function_table) {
     KernelCreateInfo info = function_table_entry();
-    if (info.kernel_def != nullptr) {
-      VLOGS_DEFAULT(V_GENERIC) << "Register kernel name: " << info.kernel_def->OpName()
-                               << ", domain: " << info.kernel_def->Domain();
-      ORT_RETURN_IF_ERROR(kernel_registry.Register(std::move(info)));
-    }
+    if (info.kernel_def == nullptr) continue;
+    const std::string& op = info.kernel_def->OpName();
+    if (shape_ops.count(op) > 0) continue;                                   // -> CPU
+    if (elem_ops.count(op) > 0 && !is_float_only(*info.kernel_def)) continue;  // int64 shape math -> CPU
+    VLOGS_DEFAULT(V_GENERIC) << "Register kernel name: " << op
+                             << ", domain: " << info.kernel_def->Domain();
+    ORT_RETURN_IF_ERROR(kernel_registry.Register(std::move(info)));
   }
 
   return Status::OK();

@@ -51,8 +51,6 @@ class Conv : public OpenCLKernel {
     const int64_t pad_l = pads_.size() > 0 ? pads_[0] : 0;
     const int64_t pad_r = pads_.size() > 1 ? pads_[1] : pad_l;
     const int64_t Wout = (W + pad_l + pad_r - dilation * (K - 1) - 1) / stride + 1;
-    LOGS_DEFAULT(ERROR) << "[OCL Conv] in=" << W << " K=" << K << " stride=" << stride
-                       << " pad=" << pad_l << " -> out=" << Wout;
     Tensor* Y = context->Output(0, TensorShape({N, M, Wout}));
 
     cl_mem bias = (B != nullptr) ? CL_BUFFER_FROM_TENSOR(*B) : CL_BUFFER_FROM_TENSOR(*X);
