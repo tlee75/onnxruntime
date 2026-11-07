@@ -46,8 +46,6 @@ class Pad : public OpenCLKernel {
       out_dims[i] = out_shape[i];
     }
     Tensor* Y = context->Output(0, TensorShape(out_dims));
-    LOGS_DEFAULT(ERROR) << "[OCL Pad] rank=" << rank << " last in=" << in_shape[rank - 1]
-                       << " -> out=" << out_shape[rank - 1];
 
     const size_t nbytes = 5 * sizeof(int64_t);
     auto in_buf = exec_->GetScratchBufferTmp(nbytes);

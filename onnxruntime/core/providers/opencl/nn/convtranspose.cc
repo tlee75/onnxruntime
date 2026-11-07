@@ -55,8 +55,6 @@ class ConvTranspose : public OpenCLKernel {
     const int64_t out_pad = output_padding_.empty() ? 0 : output_padding_[0];
     const int64_t Wout =
         (W - 1) * stride - pad_l - pad_r + dilation * (K - 1) + 1 + out_pad;
-    LOGS_DEFAULT(ERROR) << "[OCL ConvTranspose] in=" << W << " K=" << K << " stride=" << stride
-                       << " pad=" << pad_l << " -> out=" << Wout;
     Tensor* Y = context->Output(0, TensorShape({N, M, Wout}));
 
     cl_mem bias = (B != nullptr) ? CL_BUFFER_FROM_TENSOR(*B) : CL_BUFFER_FROM_TENSOR(*X);

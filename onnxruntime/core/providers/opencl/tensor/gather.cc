@@ -7,8 +7,6 @@
 #include "core/providers/cpu/tensor/gatherbase.h"
 #include "core/common/safeint.h"
 
-#include "core/framework/ortdevice.h"
-
 namespace onnxruntime {
 namespace opencl {
 
@@ -28,50 +26,10 @@ class Gather : public OpenCLKernel, public GatherBase {
   Status Compute(OpKernelContext* context) const override;
 };
 
-// template <typename Tin>
-// Status Gather(const Tensor* indices_tensor, const uint8_t* src_base, uint8_t* dst_base, bool is_string_type,
-//                       const size_t element_bytes, const int64_t block_size, const int64_t M,
-//                       const int64_t N, const int64_t data_batch_bytes, const int64_t gathered_batch_bytes,
-//                       const TensorShape& input_data_shape, const int64_t axis,OpKernelContext* context) {
-//   const Tin* indices_data = indices_tensor->Data<Tin>();
-
-//   // Check the indices first in case there's a out of bound index.
-//   auto axis_dim_limit = input_data_shape[narrow<size_t>(axis)];
-
-//   for (int64_t i = 0; i < N; ++i) {
-//     Tin idx = indices_data[i];
-//     if (idx < -axis_dim_limit || idx >= axis_dim_limit) {
-//       return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
-//                              "indices element out of data bounds, idx=", idx,
-//                              " must be within the inclusive range [", -axis_dim_limit, ",", axis_dim_limit - 1, "]");
-//     }
-//   }
-
-//   return Status::OK();
-// }
 Status Gather::Compute(OpKernelContext* context) const {
-  {
-    const Tensor* t0 = context->Input<Tensor>(0);
-    const Tensor* t1 = context->Input<Tensor>(1);
-    LOGS_DEFAULT(ERROR) << "[OCL Gather] begin t0=" << (t0 ? t0->Shape().NumDimensions() : -1)
-                        << " t1=" << (t1 ? t1->Shape().NumDimensions() : -1)
-                        << " t1_dev=" << (t1 ? static_cast<int>(t1->Location().device.Type()) : -1);
-  }
   Prepare p;
-  try {
-    ORT_RETURN_IF_ERROR(PrepareForCompute(context, p));
-  } catch (const std::exception& e) {
-    LOGS_DEFAULT(ERROR) << "[OCL Gather] prepare threw: " << e.what();
-    return Status(common::ONNXRUNTIME, common::FAIL, "gather prepare threw");
-  } catch (...) {
-    LOGS_DEFAULT(ERROR) << "[OCL Gather] prepare threw (unknown)";
-    return Status(common::ONNXRUNTIME, common::FAIL, "gather prepare threw");
-  }
+  ORT_RETURN_IF_ERROR(PrepareForCompute(context, p));
 
-  LOGS_DEFAULT(ERROR) << "[OCL Gather] in last="
-                      << (p.input_tensor->Shape().NumDimensions() ? p.input_tensor->Shape().GetDims().back() : 0)
-                      << " out last="
-                      << (p.output_tensor->Shape().NumDimensions() ? p.output_tensor->Shape().GetDims().back() : 0);
   const TensorShape& input_data_shape = p.input_tensor->Shape();
 
   bool is_string_type = p.input_tensor->IsDataTypeString();
@@ -100,22 +58,9 @@ Status Gather::Compute(OpKernelContext* context) const {
     cl_mem Input_shape = exec_->GetScratchBufferTmp(input_shape_size);
     exec_->WriteToCLBuffer(Input_shape, input_data_shape.GetDims().data(), input_shape_size);
 
-    // The indices are declared CPUInput (ORT places the initializer on the CPU),
-    // but the kernel needs them as a cl_mem — stage them into a GPU buffer.
-    const size_t idx_bytes = static_cast<size_t>(N) * sizeof(int64_t);
-    cl_mem indices_buf = exec_->GetScratchBufferTmp(idx_bytes);
-    if (p.indices_tensor->Location().device.Type() == OrtDevice::GPU) {
-      ORT_RETURN_IF_CL_ERROR(clEnqueueCopyBuffer(exec_->GetCommandQueue(),
-                                                 CL_BUFFER_FROM_TENSOR(*p.indices_tensor),
-                                                 indices_buf, 0, 0, idx_bytes, 0, nullptr, nullptr));
-    } else {
-      exec_->WriteToCLBuffer(indices_buf, p.indices_tensor->DataRaw(), idx_bytes);
-    }
-
     ORT_RETURN_IF_ERROR(
         KernelLauncher{GetKernel("Gather")}
-            .SetBuffer(indices_buf)
-            .SetBuffers(*Input, *Output)
+            .SetBuffers(*(p.indices_tensor), *Input, *Output)
             .SetArg<cl_int>((cl_int)(is_string_type ? 1 : 0))
             .SetArg<cl_long>(element_bytes)
             .SetArg<cl_long>(block_size)
@@ -127,7 +72,6 @@ Status Gather::Compute(OpKernelContext* context) const {
             .SetArg<cl_long>(p.axis)
             .Launch(*exec_, {M * N, 1, 1}));
 
-    exec_->ReleaseCLBuffer(indices_buf);
     exec_->ReleaseCLBuffer(Input_shape);
     return Status::OK();
   }
@@ -142,7 +86,6 @@ ONNX_OPERATOR_KERNEL_EX(
     kOpenCLExecutionProvider,
     (*KernelDefBuilder::Create())
         .TypeConstraint("T", DataTypeImpl::AllFixedSizeTensorTypes())
-        .InputMemoryType(OrtMemTypeCPUInput, 1)
         .TypeConstraint("Tind", std::vector<MLDataType>{
                                     DataTypeImpl::GetTensorType<int32_t>(),
                                     DataTypeImpl::GetTensorType<int64_t>()}),
