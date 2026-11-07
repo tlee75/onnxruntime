@@ -21,14 +21,17 @@ class ConvTranspose : public OpenCLKernel {
  public:
   explicit ConvTranspose(const OpKernelInfo& info) : OpenCLKernel(info) {
     info.GetAttrOrDefault<int64_t>("group", &group_, 1);
-    strides_ = {1};
-    pads_ = {0};
-    dilations_ = {1};
-    output_padding_ = {0};
+    // NB: OpKernelInfo::GetAttrs APPENDS to the vector — do NOT pre-fill.
+    strides_.clear();
+    pads_.clear();
+    dilations_.clear();
+    output_padding_.clear();
     (void)info.GetAttrs("strides", strides_);
     (void)info.GetAttrs("pads", pads_);
     (void)info.GetAttrs("dilations", dilations_);
     (void)info.GetAttrs("output_padding", output_padding_);
+    if (strides_.empty()) strides_ = {1};
+    if (dilations_.empty()) dilations_ = {1};
     LoadProgram(convtranspose_kernel_src, convtranspose_kernel_src_len);
     LoadKernel("ConvTranspose1D_Float");
   }
@@ -52,6 +55,8 @@ class ConvTranspose : public OpenCLKernel {
     const int64_t out_pad = output_padding_.empty() ? 0 : output_padding_[0];
     const int64_t Wout =
         (W - 1) * stride - pad_l - pad_r + dilation * (K - 1) + 1 + out_pad;
+    LOGS_DEFAULT(ERROR) << "[OCL ConvTranspose] in=" << W << " K=" << K << " stride=" << stride
+                       << " pad=" << pad_l << " -> out=" << Wout;
     Tensor* Y = context->Output(0, TensorShape({N, M, Wout}));
 
     cl_mem bias = (B != nullptr) ? CL_BUFFER_FROM_TENSOR(*B) : CL_BUFFER_FROM_TENSOR(*X);

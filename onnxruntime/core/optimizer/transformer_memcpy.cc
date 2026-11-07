@@ -75,12 +75,21 @@ static const onnx::TensorProto* GetInitializer(const Graph& graph, const std::st
 // and mainly provides the subgraph recursion functionality
 common::Status MemcpyTransformer::ApplyImpl(Graph& graph, bool& modified, int graph_level,
                                             const logging::Logger& logger) const {
+  {
+    std::ostringstream os;
+    os << "[MemcpyTransformer] called; providers=";
+    for (auto& p : provider_types_) os << p << ",";
+    LOGS(logger, ERROR) << os.str();
+  }
   for (auto& provider : provider_types_) {
     if (!utils::ProviderIsCpuBased(provider)) {
       TransformerMemcpyImpl copy_impl(graph, provider);
 
       int copy_node_counter = 0;
       auto current_modified = copy_impl.ModifyGraph(registry_manager_, logger, copy_node_counter);
+      LOGS(logger, ERROR) << "[MemcpyTransformer] provider=" << provider
+                         << " copy_nodes=" << copy_node_counter
+                         << " modified=" << current_modified;
       if (copy_node_counter > 0 && provider == kCudaExecutionProvider) {
         LOGS(logger, WARNING) << copy_node_counter << " Memcpy nodes are added to the graph " << graph.Name()
                               << " for " << provider
@@ -337,7 +346,7 @@ void TransformerMemcpyImpl::AddCopyNode(onnxruntime::NodeArg* arg, bool is_input
   std::string new_node_name = graph_.GenerateNodeName("Memcpy");
 
   const auto op_name = is_input ? "MemcpyFromHost" : "MemcpyToHost";
-  LOGS(logger, INFO) << "Add " << op_name << (is_input ? " after " : " before ") << arg->Name()
+  LOGS(logger, ERROR) << "Add " << op_name << (is_input ? " after " : " before ") << arg->Name()
                      << " for " << provider_;
 
   auto& new_node = graph_.AddNode(new_node_name, op_name, "Copy from/to host memory",
