@@ -121,6 +121,7 @@ class Conv : public OpenCLKernel {
                 .SetArg<cl_int>(wout_i)
                 .SetArg<cl_int>(kdim)
                 .SetArg<cl_int>(has_bias)
+                .SetArg<cl_int>(0)  // trans_a: A is [M, Kdim] (the conv weight)
                 .SetBuffer(a)
                 .SetBuffer(x)
                 .SetBuffer(y)
