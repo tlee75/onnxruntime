@@ -29,7 +29,7 @@ class Slice : public OpenCLKernel, public SliceBase {
       : OpenCLKernel(info), SliceBase(info, dynamic) {
     LoadProgram(slice_kernel_src, slice_kernel_src_len);
     LoadKernel("Slice");
-    LoadKernel("Slice_I64");
+    LoadKernel("Slice_I32");
   };
 
   Status Compute(OpKernelContext* ctx) const override;
@@ -126,7 +126,8 @@ Status Slice<dynamic>::Compute(OpKernelContext* ctx) const {
                 "Slice: a Slice dimension exceeds the OpenCL EP's 32-bit metadata");
   }
   const bool wide = input_tensor->SizeInBytes() > static_cast<int64_t>(std::numeric_limits<int>::max());
-  const char* kn = wide ? "Slice_I64" : "Slice";
+  // `Slice` is always correct; only take the 32-bit fast path when it fits.
+  const char* kn = wide ? "Slice" : "Slice_I32";
   auto to_int = [](const TensorShapeVector& v) {
     std::vector<int> out(v.size());
     for (size_t i = 0; i < v.size(); ++i) out[i] = static_cast<int>(v[i]);

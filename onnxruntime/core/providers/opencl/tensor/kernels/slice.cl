@@ -1,11 +1,11 @@
 // Shapes/strides are int32 element counts and the per-dim index math is 32-bit:
 // the per-dim values fit int for any tensor the EP accepts, and 64-bit integer
-// division is pathologically slow on some mobile GPUs (e.g. Adreno).
-//
-// The *flattened* size can still exceed int for a very large tensor, so there is
-// also a 64-bit twin (`Slice_I64`, picked by the host when the byte size does
-// not fit int). Only the running offsets/addresses widen -- the per-dim metadata
-// stays int -- so it stays correct up to 2^63 elements and pays the slow 64-bit
+// division is pathologically slow on some mobile GPUs (e.g. Adreno). The
+// *flattened* size can still exceed int for a very large tensor, so the kernel
+// is generated twice: `Slice` is the always-correct 64-bit form and
+// `Slice_I32` is the fast path the host takes only when the byte size provably
+// fits int. Only the running offsets/addresses widen (the per-dim metadata stays
+// int), so the 64-bit form is correct up to 2^63 elements and pays the slow
 // divides only in that (rare) case.
 #define DEFINE_SLICE_KERNEL(NAME, IDX)                                         \
   __kernel void NAME(__global uchar* input,                                    \
@@ -38,5 +38,8 @@
     }                                                                          \
   }
 
-DEFINE_SLICE_KERNEL(Slice, int)
-DEFINE_SLICE_KERNEL(Slice_I64, long)
+// `Slice` is the ALWAYS-correct form (64-bit); `Slice_I32` is the fast path the
+// host picks only when the byte size provably fits int. That way a host mistake
+// degrades to slow, never to wrong.
+DEFINE_SLICE_KERNEL(Slice, long)
+DEFINE_SLICE_KERNEL(Slice_I32, int)
