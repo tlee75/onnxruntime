@@ -122,7 +122,7 @@ __kernel void Conv_AddBias(
     const int ly = get_local_id(1);                                             \
     const int tid = ly * get_local_size(0) + lx;                                \
     const int nthreads = get_local_size(0) * get_local_size(1);                 \
-    __local float As[BM][BK];                                                   \
+    __local float As[BK][BM + 1]; /* transposed; +1 pad avoids store bank conflicts */                                                   \
     __local float Bs[BK][BN];                                                   \
     const int row0 = get_group_id(1) * BM;                                      \
     const int Kdim = C * K;                                                     \
@@ -138,7 +138,7 @@ __kernel void Conv_AddBias(
           const int kk = idx % BK;                                              \
           const int gr = row0 + i;                                              \
           const int gk = k0 + kk;                                               \
-          As[i][kk] = (gr < M && gk < Kdim) ? Wt[gr * Kdim + gk] : 0.0f;        \
+          As[kk][i] = (gr < M && gk < Kdim) ? Wt[gr * Kdim + gk] : 0.0f;        \
         }                                                                       \
         for (int idx = tid; idx < BK * BN; idx += nthreads) {                   \
           const int kk = idx / BN;                                              \
@@ -158,7 +158,7 @@ __kernel void Conv_AddBias(
         for (int kk = 0; kk < BK; ++kk) {                                       \
           float a[TM];                                                          \
           float b[TN];                                                          \
-          for (int i = 0; i < TM; ++i) a[i] = As[ly * TM + i][kk];              \
+          for (int i = 0; i < TM; ++i) a[i] = As[kk][ly * TM + i];              \
           for (int j = 0; j < TN; ++j) b[j] = Bs[kk][lx * TN + j];              \
           for (int i = 0; i < TM; ++i)                                          \
             for (int j = 0; j < TN; ++j) acc[i][j] += a[i] * b[j];              \
