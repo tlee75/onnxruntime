@@ -29,6 +29,7 @@
 #include "core/providers/opencl/math/trigonometric.h"
 #include "core/providers/opencl/math/Neg.h"
 #include "core/providers/opencl/activation/relu.h"
+#include "core/providers/opencl/activation/elu.h"
 #include "core/providers/opencl/math/exp.h"
 #include "core/providers/opencl/nn/conv.h"
 #include "core/providers/opencl/nn/convtranspose.h"
@@ -63,6 +64,7 @@ Status RegisterOpenCLKernels(KernelRegistry& kernel_registry) {
 
       // Vocoder ops (docs: the SEANet decoder needs conv/deconv + relu/exp/pad).
       BuildKernelCreateInfo<ONNX_OPERATOR_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 14, Relu)>,
+      BuildKernelCreateInfo<ONNX_OPERATOR_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 6, Elu)>,
       BuildKernelCreateInfo<ONNX_OPERATOR_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 13, Exp)>,
       BuildKernelCreateInfo<ONNX_OPERATOR_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 11, Conv)>,
       BuildKernelCreateInfo<ONNX_OPERATOR_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 11, ConvTranspose)>,
