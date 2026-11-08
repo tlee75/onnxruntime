@@ -92,20 +92,6 @@ __kernel void Conv_Im2col(
 
 // Add the per-output-channel bias to a Conv result: Y[m, ow] += B[m].
 // gws = (min(Wout, device cap), M); the `ow` axis grid-strides (see above).
-__kernel void Conv_AddBias(
-    const int Wout,
-    const int M,
-    __global float* Y,
-    __global const float* B) {
-  const int m = get_global_id(1);
-  if (m >= M) return;
-  const int g0 = get_global_size(0);
-  const float b = B[m];
-  for (int ow = get_global_id(0); ow < Wout; ow += g0) {
-    Y[m * Wout + ow] += b;
-  }
-}
-
 // Fused conv GEMM: Y[M, Wout] = Wt[M, C*K] @ im2col(X[C, W]), with the im2col
 // "B" operand GATHERED inline from X instead of materializing a col buffer.
 //
@@ -117,7 +103,9 @@ __kernel void Conv_AddBias(
   void NAME(                                                                    \
       const int M, const int Wout, const int C, const int W, const int K,       \
       const int stride, const int pad, const int dil,                           \
-      __global const float* Wt, __global const float* X, __global float* Y) {   \
+      const int has_bias,                                                       \
+      __global const float* Wt, __global const float* X, __global float* Y,     \
+      __global const float* B) {                                                \
     const int lx = get_local_id(0);                                             \
     const int ly = get_local_id(1);                                             \
     const int tid = ly * get_local_size(0) + lx;                                \
@@ -126,12 +114,19 @@ __kernel void Conv_AddBias(
     __local float Bs[BK][BN];                                                   \
     const int row0 = get_group_id(1) * BM;                                      \
     const int Kdim = C * K;                                                     \
+    /* Seed the accumulator with the bias: adds it exactly once per output      \
+       element, so no separate bias pass over Y is needed. */                    \
+    float bias_r[TM];                                                           \
+    for (int i = 0; i < TM; ++i) {                                              \
+      const int gr = row0 + ly * TM + i;                                        \
+      bias_r[i] = (has_bias && gr < M) ? B[gr] : 0.0f;                          \
+    }                                                                           \
     const int numNtiles = (Wout + BN - 1) / BN;                                 \
     for (int nt = get_group_id(0); nt < numNtiles; nt += get_num_groups(0)) {   \
       const int col0 = nt * BN;                                                 \
       float acc[TM][TN];                                                        \
       for (int i = 0; i < TM; ++i)                                              \
-        for (int j = 0; j < TN; ++j) acc[i][j] = 0.0f;                          \
+        for (int j = 0; j < TN; ++j) acc[i][j] = bias_r[i];                     \
       for (int k0 = 0; k0 < Kdim; k0 += BK) {                                   \
         for (int idx = tid; idx < BM * BK; idx += nthreads) {                   \
           const int i = idx / BK;                                               \
@@ -197,8 +192,9 @@ DEFINE_GEMM_TILED_CONV(Gemm_Tiled_Conv_BN32, 64, 32, 32, 4, 4)
   __kernel __attribute__((reqd_work_group_size(BN / TN, BM / TM, 1)))           \
   void NAME(const int M, const int Wout, const int C, const int W,              \
             const int K, const int stride, const int pad, const int dil,        \
+            const int has_bias,                                                 \
             __global const float* Wt, __global const float* X,                   \
-            __global float* Y) {                                                \
+            __global float* Y, __global const float* B) {                       \
     const int lx = get_local_id(0);                                             \
     const int ly = get_local_id(1);                                             \
     const int tid = ly * get_local_size(0) + lx;                                \
@@ -207,12 +203,18 @@ DEFINE_GEMM_TILED_CONV(Gemm_Tiled_Conv_BN32, 64, 32, 32, 4, 4)
     __local half Bs[BK][BN];                                                    \
     const int row0 = get_group_id(1) * BM;                                      \
     const int Kdim = C * K;                                                     \
+    half bias_r[TM];                                                            \
+    for (int i = 0; i < TM; ++i) {                                              \
+      const int gr = row0 + ly * TM + i;                                        \
+      bias_r[i] = (half)((has_bias && gr < M) ? B[gr] : 0.0f);                  \
+    }                                                                           \
     const int numNtiles = (Wout + BN - 1) / BN;                                 \
     for (int nt = get_group_id(0); nt < numNtiles; nt += get_num_groups(0)) {   \
       const int col0 = nt * BN;                                                 \
       half2 acc2[TM][TN / 2];                                                    \
       for (int i = 0; i < TM; ++i)                                              \
-        for (int j2 = 0; j2 < TN / 2; ++j2) acc2[i][j2] = (half2)(0.0f, 0.0f);  \
+        for (int j2 = 0; j2 < TN / 2; ++j2)                                     \
+          acc2[i][j2] = (half2)(bias_r[i], bias_r[i]);                          \
       for (int k0 = 0; k0 < Kdim; k0 += BK) {                                   \
         for (int idx = tid; idx < BM * BK; idx += nthreads) {                   \
           const int i = idx / BK;                                               \

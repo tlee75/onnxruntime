@@ -46,7 +46,6 @@ class Conv : public OpenCLKernel {
     LoadProgram(conv_kernel_src, conv_kernel_src_len);
     LoadKernel("Conv1D_Float");
     LoadKernel("Conv_Im2col");
-    LoadKernel("Conv_AddBias");
     LoadKernel("Gemm_Tiled");
     LoadKernel("Gemm_Tiled_Conv");
     LoadKernel("Gemm_Tiled_Conv_BM32");
@@ -121,9 +120,11 @@ class Conv : public OpenCLKernel {
                 .SetArg<cl_int>(m_i)
                 .SetArg<cl_int>(wout_i)
                 .SetArg<cl_int>(kdim)
+                .SetArg<cl_int>(has_bias)
                 .SetBuffer(a)
                 .SetBuffer(x)
                 .SetBuffer(y)
+                .SetBuffer(bias)
                 .Launch(*exec_, NDRange(gn_used * lx, gm * ly), NDRange(lx, ly)));
       } else {
         // General conv: fuse im2col into the GEMM. The conv GEMM is short and
@@ -155,21 +156,12 @@ class Conv : public OpenCLKernel {
                 .SetArg<cl_int>(static_cast<cl_int>(stride))
                 .SetArg<cl_int>(static_cast<cl_int>(pad_l))
                 .SetArg<cl_int>(static_cast<cl_int>(dilation))
+                .SetArg<cl_int>(has_bias)
                 .SetBuffer(a)
                 .SetBuffer(x)
                 .SetBuffer(y)
-                .Launch(*exec_, NDRange(fgn_used * flx, fgm * fly), NDRange(flx, fly)));
-      }
-
-      if (has_bias) {
-        ORT_RETURN_IF_ERROR(
-            KernelLauncher{GetKernel("Conv_AddBias")}
-                .SetArg<cl_int>(wout_i)
-                .SetArg<cl_int>(m_i)
-                .SetBuffer(y)
                 .SetBuffer(bias)
-                .Launch(*exec_, NDRange(std::min<size_t>(static_cast<size_t>(wout_i), cap0),
-                                        static_cast<size_t>(m_i))));
+                .Launch(*exec_, NDRange(fgn_used * flx, fgm * fly), NDRange(flx, fly)));
       }
       return Status::OK();
     }
