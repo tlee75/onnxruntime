@@ -56,6 +56,9 @@ TensorShape broadcast_shape(const TensorShape& shape1, const TensorShape& shape2
     explicit CLASS_NAME(const OpKernelInfo& info) : OpenCLKernel(info) {                                                \
       LoadProgram(elementwise_kernel_src, elementwise_kernel_src_len);                                                  \
       LoadKernel(#CLASS_NAME);\
+      LoadKernel(#CLASS_NAME "_lin");\
+      LoadKernel(#CLASS_NAME "_scalar_a");\
+      LoadKernel(#CLASS_NAME "_scalar_b");                                                                                          \
     };                                                                                                                  \
                                                                                                                         \
     Status Compute(OpKernelContext* context) const override {                                                           \
@@ -66,6 +69,11 @@ TensorShape broadcast_shape(const TensorShape& shape1, const TensorShape& shape2
       auto* c = context->Output(0, out_shape);                                                                          \
       ORT_ENFORCE(c->Shape().Size() <= static_cast<int64_t>(std::numeric_limits<int>::max()),                             \
                   "Elementwise: tensor too large for the OpenCL EP's 32-bit indexing");\
+      if ((a->Shape() == out_shape && b->Shape() == out_shape) || b->Shape().Size() == 1 || a->Shape().Size() == 1) {\
+        const std::string _kn = (a->Shape() == out_shape && b->Shape() == out_shape) ? #CLASS_NAME "_lin" : (b->Shape().Size() == 1 ? #CLASS_NAME "_scalar_b" : #CLASS_NAME "_scalar_a");\
+        ORT_RETURN_IF_ERROR(KernelLauncher{GetKernel(_kn)}.SetBuffers(*a, *b, *c).Launch(*exec_, {static_cast<size_t>(out_shape.Size()), 1, 1}));\
+        return Status::OK();\
+      }  \
       const size_t Shape_sIze = 5 * sizeof(int);             \
       auto A_Shape = exec_->GetScratchBufferTmp(Shape_sIze);  \
       auto B_Shape = exec_->GetScratchBufferTmp(Shape_sIze);  \
@@ -147,6 +155,9 @@ ONNX_OPERATOR_VERSIONED_KERNEL_EX(
     explicit CLASS_NAME(const OpKernelInfo& info) : OpenCLKernel(info) {                                                \
       LoadProgram(elementwise_kernel_src, elementwise_kernel_src_len);                                                  \
       LoadKernel(#CLASS_NAME);\
+      LoadKernel(#CLASS_NAME "_lin");\
+      LoadKernel(#CLASS_NAME "_scalar_a");\
+      LoadKernel(#CLASS_NAME "_scalar_b");                                                                                          \
     };                                                                                                                  \
                                                                                                                         \
     Status Compute(OpKernelContext* context) const override {                                                           \
@@ -157,6 +168,11 @@ ONNX_OPERATOR_VERSIONED_KERNEL_EX(
       auto* c = context->Output(0, out_shape);                                                                          \
       ORT_ENFORCE(c->Shape().Size() <= static_cast<int64_t>(std::numeric_limits<int>::max()),                             \
                   "Elementwise: tensor too large for the OpenCL EP's 32-bit indexing");\
+      if ((a->Shape() == out_shape && b->Shape() == out_shape) || b->Shape().Size() == 1 || a->Shape().Size() == 1) {\
+        const std::string _kn = (a->Shape() == out_shape && b->Shape() == out_shape) ? #CLASS_NAME "_lin" : (b->Shape().Size() == 1 ? #CLASS_NAME "_scalar_b" : #CLASS_NAME "_scalar_a");\
+        ORT_RETURN_IF_ERROR(KernelLauncher{GetKernel(_kn)}.SetBuffers(*a, *b, *c).Launch(*exec_, {static_cast<size_t>(out_shape.Size()), 1, 1}));\
+        return Status::OK();\
+      }  \
       const size_t Shape_sIze = 5 * sizeof(int);             \
       auto A_Shape = exec_->GetScratchBufferTmp(Shape_sIze);  \
       auto B_Shape = exec_->GetScratchBufferTmp(Shape_sIze);  \

@@ -173,3 +173,84 @@ DEFINE_LOGICOP_KERNEL(long, long, greater, GREATER_OP)
 DEFINE_LOGICOP_KERNEL(long, long, equal, EQUAL_OP)
 
 DEFINE_LOGICOP_KERNEL(uchar, bool, equal, EQUAL_OP)
+
+// ---------------------------------------------------------------------------
+// Fast paths for the common no-broadcast cases: identical input/output shapes,
+// or a scalar operand. These kernels do NO index math, so they avoid integer
+// division entirely (which is slow on some mobile GPUs even in 32-bit, e.g.
+// Adreno). The host (elementwise.cc) uses one when it applies, else the
+// general broadcast kernel above.
+#define DEFINE_OP_FAST_KERNELS(type, type_suffix, op_name, operation)      \
+  __kernel void op_name##_##type_suffix##_lin(                             \
+      __global type* A, __global type* B, __global type* C) {              \
+    int gid = get_global_id(0);                                            \
+    C[gid] = operation(A[gid], B[gid]);                                    \
+  }                                                                        \
+  __kernel void op_name##_##type_suffix##_scalar_a(                        \
+      __global type* A, __global type* B, __global type* C) {              \
+    int gid = get_global_id(0);                                            \
+    C[gid] = operation(A[0], B[gid]);                                      \
+  }                                                                        \
+  __kernel void op_name##_##type_suffix##_scalar_b(                        \
+      __global type* A, __global type* B, __global type* C) {              \
+    int gid = get_global_id(0);                                            \
+    C[gid] = operation(A[gid], B[0]);                                      \
+  }
+
+#define DEFINE_LOGICOP_FAST_KERNELS(type, type_suffix, op_name, operation) \
+  __kernel void op_name##_##type_suffix##_lin(                             \
+      __global type* A, __global type* B, __global uchar* C) {             \
+    int gid = get_global_id(0);                                            \
+    C[gid] = operation(A[gid], B[gid]);                                    \
+  }                                                                        \
+  __kernel void op_name##_##type_suffix##_scalar_a(                        \
+      __global type* A, __global type* B, __global uchar* C) {             \
+    int gid = get_global_id(0);                                            \
+    C[gid] = operation(A[0], B[gid]);                                      \
+  }                                                                        \
+  __kernel void op_name##_##type_suffix##_scalar_b(                        \
+      __global type* A, __global type* B, __global uchar* C) {             \
+    int gid = get_global_id(0);                                            \
+    C[gid] = operation(A[gid], B[0]);                                      \
+  }
+
+DEFINE_OP_FAST_KERNELS(float, float, add, ADD_OP)
+DEFINE_OP_FAST_KERNELS(float, float, sub, SUB_OP)
+DEFINE_OP_FAST_KERNELS(float, float, mul, MUL_OP)
+DEFINE_OP_FAST_KERNELS(float, float, div, DIV_OP)
+DEFINE_OP_FAST_KERNELS(float, float, pow, POW_OP)
+#if defined(cl_khr_fp64)
+DEFINE_OP_FAST_KERNELS(double, double, add, ADD_OP)
+DEFINE_OP_FAST_KERNELS(double, double, sub, SUB_OP)
+DEFINE_OP_FAST_KERNELS(double, double, mul, MUL_OP)
+DEFINE_OP_FAST_KERNELS(double, double, div, DIV_OP)
+DEFINE_OP_FAST_KERNELS(double, double, pow, POW_OP)
+#endif
+DEFINE_OP_FAST_KERNELS(int, int, add, ADD_OP)
+DEFINE_OP_FAST_KERNELS(int, int, sub, SUB_OP)
+DEFINE_OP_FAST_KERNELS(int, int, mul, MUL_OP)
+DEFINE_OP_FAST_KERNELS(int, int, div, DIV_OP)
+DEFINE_OP_FAST_KERNELS(long, long, add, ADD_OP)
+DEFINE_OP_FAST_KERNELS(long, long, sub, SUB_OP)
+DEFINE_OP_FAST_KERNELS(long, long, mul, MUL_OP)
+DEFINE_OP_FAST_KERNELS(long, long, div, DIV_OP)
+
+DEFINE_LOGICOP_FAST_KERNELS(float, float, greater, GREATER_OP)
+DEFINE_LOGICOP_FAST_KERNELS(float, float, equal, EQUAL_OP)
+#if defined(cl_khr_fp64)
+DEFINE_LOGICOP_FAST_KERNELS(double, double, greater, GREATER_OP)
+DEFINE_LOGICOP_FAST_KERNELS(double, double, equal, EQUAL_OP)
+#endif
+DEFINE_LOGICOP_FAST_KERNELS(int, int, greater, GREATER_OP)
+DEFINE_LOGICOP_FAST_KERNELS(int, int, equal, EQUAL_OP)
+DEFINE_LOGICOP_FAST_KERNELS(long, long, greater, GREATER_OP)
+DEFINE_LOGICOP_FAST_KERNELS(long, long, equal, EQUAL_OP)
+DEFINE_LOGICOP_FAST_KERNELS(uchar, bool, equal, EQUAL_OP)
+
+#ifdef USE_FP16
+DEFINE_OP_FAST_KERNELS(half, fp16, add, ADD_OP)
+DEFINE_OP_FAST_KERNELS(half, fp16, sub, SUB_OP)
+DEFINE_OP_FAST_KERNELS(half, fp16, mul, MUL_OP)
+DEFINE_OP_FAST_KERNELS(half, fp16, div, DIV_OP)
+DEFINE_OP_FAST_KERNELS(half, fp16, pow, POW_OP)
+#endif
