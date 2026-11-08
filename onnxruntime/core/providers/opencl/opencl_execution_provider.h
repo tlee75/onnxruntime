@@ -3,6 +3,12 @@
 
 #pragma once
 
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 #include "opencl_utils.h"
 #include "opencl_forward_decl.h"
 
@@ -101,17 +107,14 @@ class OpenCLExecutionProvider : public IExecutionProvider {
   void WriteToCLBuffer(cl_mem buffer, const void* host_ptr, size_t nbytes);
   void ReadFromCLBuffer(cl_mem buffer,void* host_ptr,size_t nbytes);
 
-  void ReleaseCLBuffer(cl_mem buffer) {
-      if (buffer == NULL) {
-          return;
-      }
+  /// Return a device buffer holding `data`, uploading it only when the bytes for
+  /// `key` change. Shape/stride metadata is constant across runs for a fixed
+  /// graph, so this avoids the per-op blocking write (a full in-order-queue
+  /// drain) on every run. `key` should identify the op instance + slot, keeping
+  /// the cache bounded.
+  cl_mem GetOrUploadMetadata(uint64_t key, const void* data, size_t nbytes);
 
-      cl_int err;
-      err = clReleaseMemObject(buffer);
-      if (err != CL_SUCCESS) {
-          printf("Error releasing buffer: %d\n", err);
-      }
-  }
+  void ReleaseCLBuffer(cl_mem buffer);
 
   // /// Get an OpenCL Buffer for temporary usage from Image2D allocator.
   // IAllocatorUniquePtrToClMem GetScratchImage2D(const opencl::Image2DDesc& desc) const;
@@ -150,6 +153,21 @@ class OpenCLExecutionProvider : public IExecutionProvider {
   bool flush_after_launch_;
   std::string compile_options_;
   opencl::OpenCLDeviceInfo dev_info_;
+
+  // Metadata upload cache (see GetOrUploadMetadata): key -> device buffer +
+  // the bytes last uploaded, so an unchanged upload is skipped.
+  struct MetaEntry {
+    cl_mem buf = nullptr;
+    size_t cap = 0;
+    std::vector<uint8_t> bytes;
+  };
+  mutable std::mutex aux_mu_;
+  mutable std::unordered_map<uint64_t, MetaEntry> meta_cache_;
+
+  // Scratch-buffer reuse: size -> free buffers, and buffer -> size, so a freed
+  // scratch buffer is handed back out instead of churning the allocator.
+  mutable std::unordered_map<cl_mem, size_t> scratch_size_;
+  mutable std::unordered_map<size_t, std::vector<cl_mem>> scratch_pool_;
 
  private:
   std::unique_ptr<opencl::OpenCLProgramManager> program_manager_;

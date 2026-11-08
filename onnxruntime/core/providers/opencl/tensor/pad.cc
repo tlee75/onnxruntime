@@ -48,13 +48,15 @@ class Pad : public OpenCLKernel {
     }
     Tensor* Y = context->Output(0, TensorShape(out_dims));
 
+    // Shape/pad metadata is constant for a fixed graph; upload it once (cached)
+    // so it never inserts a blocking write into the pipeline. Keyed by this op
+    // instance, so the cache stays bounded.
     const size_t nbytes = 5 * sizeof(int);
-    auto in_buf = exec_->GetScratchBufferTmp(nbytes);
-    auto out_buf = exec_->GetScratchBufferTmp(nbytes);
-    auto begin_buf = exec_->GetScratchBufferTmp(nbytes);
-    exec_->WriteToCLBuffer(in_buf, in_shape, nbytes);
-    exec_->WriteToCLBuffer(out_buf, out_shape, nbytes);
-    exec_->WriteToCLBuffer(begin_buf, begin, nbytes);
+    const uint64_t base = reinterpret_cast<uint64_t>(this) * 8;
+    cl_mem in_buf = exec_->GetOrUploadMetadata(base + 0, in_shape, nbytes);
+    cl_mem out_buf = exec_->GetOrUploadMetadata(base + 1, out_shape, nbytes);
+    cl_mem begin_buf = exec_->GetOrUploadMetadata(base + 2, begin, nbytes);
+
     ORT_RETURN_IF_ERROR(
         KernelLauncher{GetKernel("Pad_Float")}
             .SetBuffers(*X, *Y)
@@ -63,9 +65,6 @@ class Pad : public OpenCLKernel {
             .SetArg<cl_float>(constant_value)
             .Launch(*exec_, {Y->Shape().Size(), 1, 1}));
 
-    exec_->ReleaseCLBuffer(in_buf);
-    exec_->ReleaseCLBuffer(out_buf);
-    exec_->ReleaseCLBuffer(begin_buf);
     return Status::OK();
   }
 };

@@ -131,14 +131,14 @@ Status Slice<dynamic>::Compute(OpKernelContext* ctx) const {
   const std::vector<int> starts = to_int(compute_metadata.starts_);
   const std::vector<int> steps = to_int(compute_metadata.steps_);
 
-  auto Input_strides = exec_->GetScratchBufferTmp(in_strides.size() * sizeof(int));
-  exec_->WriteToCLBuffer(Input_strides, in_strides.data(), in_strides.size() * sizeof(int));
-  auto Output_strides = exec_->GetScratchBufferTmp(out_strides.size() * sizeof(int));
-  exec_->WriteToCLBuffer(Output_strides, out_strides.data(), out_strides.size() * sizeof(int));
-  auto input_starts_mem = exec_->GetScratchBufferTmp(starts.size() * sizeof(int));
-  exec_->WriteToCLBuffer(input_starts_mem, starts.data(), starts.size() * sizeof(int));
-  auto input_steps_mem = exec_->GetScratchBufferTmp(steps.size() * sizeof(int));
-  exec_->WriteToCLBuffer(input_steps_mem, steps.data(), steps.size() * sizeof(int));
+  // Stride/start/step metadata is constant for a fixed graph; upload it once
+  // (cached) so it never inserts a blocking write into the pipeline. Keyed by
+  // this op instance, so the cache stays bounded.
+  const uint64_t base = reinterpret_cast<uint64_t>(this) * 8;
+  cl_mem Input_strides = exec_->GetOrUploadMetadata(base + 0, in_strides.data(), in_strides.size() * sizeof(int));
+  cl_mem Output_strides = exec_->GetOrUploadMetadata(base + 1, out_strides.data(), out_strides.size() * sizeof(int));
+  cl_mem input_starts_mem = exec_->GetOrUploadMetadata(base + 2, starts.data(), starts.size() * sizeof(int));
+  cl_mem input_steps_mem = exec_->GetOrUploadMetadata(base + 3, steps.data(), steps.size() * sizeof(int));
 
   ORT_RETURN_IF_ERROR(
       KernelLauncher{GetKernel("Slice")}
@@ -151,10 +151,8 @@ Status Slice<dynamic>::Compute(OpKernelContext* ctx) const {
           .SetArg<cl_int>((cl_int)input_tensor->SizeInBytes())
           .Launch(*exec_, {output_tensor->SizeInBytes() / input_tensor->DataType()->Size(), 1, 1}));
 
-  exec_->ReleaseCLBuffer(Input_strides);
-  exec_->ReleaseCLBuffer(Output_strides);
-  exec_->ReleaseCLBuffer(input_starts_mem);
-  exec_->ReleaseCLBuffer(input_steps_mem);
+  // The stride/start/step buffers are owned by the EP metadata cache
+  // (GetOrUploadMetadata), so they are not released here.
   exec_->Sync();
   return Status::OK();
 }
