@@ -39,7 +39,7 @@ Status Unsqueeze::Compute(OpKernelContext* ctx) const {
   if (err != CL_SUCCESS) {
     return Status(common::ONNXRUNTIME, common::FAIL, "Failed to copy buffer");
   }
-  clFinish(exec_->GetCommandQueue());
+  // No clFinish: the copy is on the in-order queue; the run drains at the end.
 
   return Status::OK();
 }

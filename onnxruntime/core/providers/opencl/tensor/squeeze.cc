@@ -54,7 +54,9 @@ Status Squeeze::Compute(OpKernelContext* context) const {
     if (err != CL_SUCCESS) {
       return Status(common::ONNXRUNTIME, common::FAIL, "Failed to copy buffer");
     }
-    clFinish(exec_->GetCommandQueue());
+    // No clFinish: the copy is on the in-order queue, so any later read of Y is
+    // already ordered after it; the run drains once at the end. A drain here
+    // would idle the GPU mid-graph (see the note in slice.cc).
   }
   return Status::OK();
 }
