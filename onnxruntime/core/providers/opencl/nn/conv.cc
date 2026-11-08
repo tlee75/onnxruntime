@@ -4,10 +4,6 @@
 #include "conv.h"
 
 #include <algorithm>
-#include <cstdio>
-#include <mutex>
-#include <set>
-#include <string>
 #include <vector>
 
 #include "core/providers/opencl/opencl_kernel.h"
@@ -64,14 +60,6 @@ class Conv : public OpenCLKernel {
     return (exec_->SupportsFp16() && exec_->UseFp16()) ? "Gemm_Tiled_F16" : "Gemm_Tiled";
   }
 
-  // The conv GEMM is short and wide (tiny M, huge Wout), so pick a small-BM
-  // tile: a BM x BN accumulator tile wastes (BM - M) padded rows when M < BM.
-  const char* ConvGemmKernel(int M) const {
-    if (M <= 16) return "Gemm_Tiled_Conv_BM16";
-    if (M <= 32) return "Gemm_Tiled_Conv_BM32";
-    return "Gemm_Tiled_Conv";
-  }
-
   Status Compute(OpKernelContext* context) const override {
     const Tensor* X = context->Input<Tensor>(0);
     const Tensor* Wt = context->Input<Tensor>(1);
@@ -104,19 +92,6 @@ class Conv : public OpenCLKernel {
       const int m_i = static_cast<int>(M);
       const int wout_i = static_cast<int>(Wout);
       const int kdim = c_i * k_i;
-      // TEMP: log each distinct conv shape once (M under-filling the BM tile is
-      // a candidate for the GEMM being occupancy-bound).
-      {
-        static std::mutex shape_mtx;
-        static std::set<std::string> shape_seen;
-        std::lock_guard<std::mutex> g(shape_mtx);
-        char buf[160];
-        snprintf(buf, sizeof(buf), "M=%d C=%d W=%d K=%d Wout=%d stride=%d pad=%d",
-                 m_i, c_i, w_i, k_i, wout_i, static_cast<int>(stride), static_cast<int>(pad_l));
-        if (shape_seen.insert(buf).second) {
-          LOGS_DEFAULT(ERROR) << "[CONVSHAPE] " << buf;
-        }
-      }
       // Per-dimension global work size cap (Adreno rejects huge per-dim sizes;
       // the kernels grid-stride over Wout).
       const size_t cap0 = exec_->MaxWorkItemSize(0);

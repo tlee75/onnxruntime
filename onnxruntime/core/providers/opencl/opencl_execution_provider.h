@@ -125,9 +125,6 @@ class OpenCLExecutionProvider : public IExecutionProvider {
 
   void ReleaseCLBuffer(cl_mem buffer);
 
-  // TEMP diagnostics: accumulate host-side time by category (see ProfHostAdd).
-  void ProfHostAdd(int cat, uint64_t ns) const;
-
   // /// Get an OpenCL Buffer for temporary usage from Image2D allocator.
   // IAllocatorUniquePtrToClMem GetScratchImage2D(const opencl::Image2DDesc& desc) const;
 
@@ -142,12 +139,6 @@ class OpenCLExecutionProvider : public IExecutionProvider {
   /// OpenCL after kernel launch performance heuristic. This is called in
   /// KernelLauncher
   Status AfterCLLaunch() const;
-
-  // TEMP diagnostics: record a launched kernel with its profiling event and the
-  // host time the enqueue took. ProfDump() clFinishes, prints a per-kernel
-  // host/GPU breakdown, and resets.
-  void ProfRecord(const char* name, cl_event ev, uint64_t host_ns) const;
-  void ProfDump() const;
 
   const std::string GetCompileOptions() const { return compile_options_; };
 
@@ -171,20 +162,6 @@ class OpenCLExecutionProvider : public IExecutionProvider {
   bool flush_after_launch_;
   std::string compile_options_;
   opencl::OpenCLDeviceInfo dev_info_;
-
-  // TEMP diagnostics
-  struct ProfEntry {
-    std::string name;
-    uint64_t host_ns;
-    cl_event ev;
-  };
-  mutable std::mutex prof_mu_;
-  mutable std::vector<ProfEntry> prof_entries_;
-  // TEMP diagnostics: host-side time by category
-  // 0=WriteToCLBuffer 1=GetScratchBufferTmp 2=ReleaseCLBuffer
-  // 3=d2h read 4=h2d write
-  mutable uint64_t prof_host_ns_[6] = {0, 0, 0, 0, 0, 0};
-  mutable uint64_t prof_host_n_[6] = {0, 0, 0, 0, 0, 0};
 
   // Metadata upload cache (see GetOrUploadMetadata): key -> device buffer +
   // the bytes last uploaded, so an unchanged upload is skipped.

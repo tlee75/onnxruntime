@@ -82,7 +82,7 @@ void Gemm_Tiled(
   const int tid = ly * get_local_size(0) + lx;
   const int nthreads = get_local_size(0) * get_local_size(1);
 
-  __local float As[GEMM_BM][GEMM_BK];
+  __local float As[GEMM_BK][GEMM_BM + 1];  // transposed (+1 pad: avoids store bank conflicts)
   __local float Bs[GEMM_BK][GEMM_BN];
 
   const int row0 = get_group_id(1) * GEMM_BM;
@@ -102,7 +102,7 @@ void Gemm_Tiled(
         const int kk = idx % GEMM_BK;
         const int gr = row0 + i;
         const int gk = k0 + kk;
-        As[i][kk] = (gr < M && gk < K) ? A[gr * K + gk] : 0.0f;
+        As[kk][i] = (gr < M && gk < K) ? A[gr * K + gk] : 0.0f;
       }
       for (int idx = tid; idx < GEMM_BK * GEMM_BN; idx += nthreads) {
         const int kk = idx / GEMM_BN;
@@ -116,7 +116,7 @@ void Gemm_Tiled(
       for (int kk = 0; kk < GEMM_BK; ++kk) {
         float a[GEMM_TM];
         float b[GEMM_TN];
-        for (int i = 0; i < GEMM_TM; ++i) a[i] = As[ly * GEMM_TM + i][kk];
+        for (int i = 0; i < GEMM_TM; ++i) a[i] = As[kk][ly * GEMM_TM + i];
         for (int j = 0; j < GEMM_TN; ++j) b[j] = Bs[kk][lx * GEMM_TN + j];
         for (int i = 0; i < GEMM_TM; ++i)
           for (int j = 0; j < GEMM_TN; ++j)
