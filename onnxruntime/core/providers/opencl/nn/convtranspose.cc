@@ -16,7 +16,17 @@ namespace {
 #include "opencl_generated/nn/kernels/convtranspose.cl.inc"
 }  // namespace
 
+// Must match the tile sizes in gemm.cl (Gemm_Tiled).
+static constexpr int kGemmBM = 64;
+static constexpr int kGemmBN = 64;
+static constexpr int kGemmTM = 4;
+static constexpr int kGemmTN = 4;
+
 // 1D transposed convolution on the OpenCL EP (rank-3 input/weight only).
+//
+// Fast path (group==1, batch==1): transpose the weight to [M*K, C], one tiled
+// GEMM P[M*K, W] = WtT[M*K, C] @ X[C, W], then a col2im gather into Y. This is
+// the vocoder's hot path. Everything else falls back to the naive kernel.
 class ConvTranspose : public OpenCLKernel {
  public:
   explicit ConvTranspose(const OpKernelInfo& info) : OpenCLKernel(info) {
@@ -34,6 +44,9 @@ class ConvTranspose : public OpenCLKernel {
     if (dilations_.empty()) dilations_ = {1};
     LoadProgram(convtranspose_kernel_src, convtranspose_kernel_src_len);
     LoadKernel("ConvTranspose1D_Float");
+    LoadKernel("ConvTranspose_TransposeWeight");
+    LoadKernel("ConvTranspose_Col2im");
+    LoadKernel("Gemm_Tiled");
   }
 
   Status Compute(OpKernelContext* context) const override {
@@ -57,9 +70,75 @@ class ConvTranspose : public OpenCLKernel {
         (W - 1) * stride - pad_l - pad_r + dilation * (K - 1) + 1 + out_pad;
     Tensor* Y = context->Output(0, TensorShape({N, M, Wout}));
 
+    if (N * M * Wout == 0) {
+      return Status::OK();
+    }
+
     cl_mem bias = (B != nullptr) ? CL_BUFFER_FROM_TENSOR(*B) : CL_BUFFER_FROM_TENSOR(*X);
     const int has_bias = (B != nullptr) ? 1 : 0;
 
+    if (group_ == 1 && N == 1) {
+      const int c_i = static_cast<int>(C);
+      const int w_i = static_cast<int>(W);
+      const int k_i = static_cast<int>(K);
+      const int m_i = static_cast<int>(M);
+      const int wout_i = static_cast<int>(Wout);
+      const int mk = m_i * k_i;  // rows of WtT / P
+
+      cl_mem wt = CL_BUFFER_FROM_TENSOR(*Wt);
+      cl_mem x = CL_BUFFER_FROM_TENSOR(*X);
+      cl_mem y = CL_BUFFER_FROM_TENSOR(*Y);
+
+      cl_mem wtt = exec_->GetScratchBufferTmp(static_cast<size_t>(mk) * c_i * sizeof(float));
+      cl_mem p = exec_->GetScratchBufferTmp(static_cast<size_t>(mk) * w_i * sizeof(float));
+
+      // WtT[M*K, C] = transpose of Wt[C, M*K]
+      ORT_RETURN_IF_ERROR(
+          KernelLauncher{GetKernel("ConvTranspose_TransposeWeight")}
+              .SetArg<cl_int>(c_i)
+              .SetArg<cl_int>(m_i)
+              .SetArg<cl_int>(k_i)
+              .SetBuffer(wt)
+              .SetBuffer(wtt)
+              .Launch(*exec_, NDRange(static_cast<size_t>(c_i), static_cast<size_t>(mk))));
+
+      // P[M*K, W] = WtT[M*K, C] @ X[C, W]
+      const size_t lx = kGemmBN / kGemmTN;
+      const size_t ly = kGemmBM / kGemmTM;
+      const size_t gn = (static_cast<size_t>(w_i) + kGemmBN - 1) / kGemmBN;
+      const size_t gm = (static_cast<size_t>(mk) + kGemmBM - 1) / kGemmBM;
+      ORT_RETURN_IF_ERROR(
+          KernelLauncher{GetKernel("Gemm_Tiled")}
+              .SetArg<cl_int>(mk)
+              .SetArg<cl_int>(w_i)
+              .SetArg<cl_int>(c_i)
+              .SetBuffer(wtt)
+              .SetBuffer(x)
+              .SetBuffer(p)
+              .Launch(*exec_, NDRange(gn * lx, gm * ly), NDRange(lx, ly)));
+
+      // Y[m, ow] = B[m] + sum_k P[m*K + k, (ow + pad - k*dil)/stride]
+      ORT_RETURN_IF_ERROR(
+          KernelLauncher{GetKernel("ConvTranspose_Col2im")}
+              .SetArg<cl_int>(m_i)
+              .SetArg<cl_int>(k_i)
+              .SetArg<cl_int>(w_i)
+              .SetArg<cl_int>(wout_i)
+              .SetArg<cl_int>(static_cast<cl_int>(stride))
+              .SetArg<cl_int>(static_cast<cl_int>(pad_l))
+              .SetArg<cl_int>(static_cast<cl_int>(dilation))
+              .SetArg<cl_int>(has_bias)
+              .SetBuffer(p)
+              .SetBuffer(bias)
+              .SetBuffer(y)
+              .Launch(*exec_, NDRange(static_cast<size_t>(wout_i), static_cast<size_t>(m_i))));
+
+      exec_->ReleaseCLBuffer(wtt);
+      exec_->ReleaseCLBuffer(p);
+      return Status::OK();
+    }
+
+    // Naive fallback.
     ORT_RETURN_IF_ERROR(
         KernelLauncher{GetKernel("ConvTranspose1D_Float")}
             .SetBuffer(*X)
@@ -76,7 +155,7 @@ class ConvTranspose : public OpenCLKernel {
             .SetArg<cl_int>(static_cast<cl_int>(stride))
             .SetArg<cl_int>(static_cast<cl_int>(pad_l))
             .SetArg<cl_int>(static_cast<cl_int>(dilation))
-            .SetArg<cl_int>(static_cast<cl_int>(has_bias))
+            .SetArg<cl_int>(has_bias)
             .Launch(*exec_, {N * M * Wout, 1, 1}));
 
     return Status::OK();
