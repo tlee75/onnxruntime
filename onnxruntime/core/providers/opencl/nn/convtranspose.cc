@@ -122,9 +122,11 @@ class ConvTranspose : public OpenCLKernel {
               .SetArg<cl_int>(mk)
               .SetArg<cl_int>(w_i)
               .SetArg<cl_int>(c_i)
+              .SetArg<cl_int>(0)  // bias applied by Col2im below
               .SetBuffer(wtt)
               .SetBuffer(x)
               .SetBuffer(p)
+              .SetBuffer(bias)
               .Launch(*exec_, NDRange(gn_used * lx, gm * ly), NDRange(lx, ly)));
 
       // Y[m, ow] = B[m] + sum_k P[m*K + k, (ow + pad - k*dil)/stride]
