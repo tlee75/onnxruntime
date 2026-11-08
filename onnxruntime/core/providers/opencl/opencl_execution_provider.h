@@ -102,6 +102,15 @@ class OpenCLExecutionProvider : public IExecutionProvider {
     return cfg != 0;
   }
 
+  /// True when the device advertises cl_khr_fp16 (so the *_F16 kernels exist).
+  bool SupportsFp16() const { return dev_info_.has_fp16; }
+
+  /// CL_DEVICE_MAX_WORK_ITEM_SIZES[dim] — the per-dimension cap on the GLOBAL
+  /// work size. A kernel whose grid exceeds it must grid-stride: Mali tolerates
+  /// huge per-dimension sizes, but Adreno (smaller cap) can reject or schedule
+  /// them pathologically.
+  size_t MaxWorkItemSize(int dim) const { return dev_info_.max_work_item_size[dim]; }
+
   // /// Get an OpenCL Buffer for temporary usage from Buffer allocator.
   cl_mem GetScratchBufferTmp(size_t nbytes) const;
   void WriteToCLBuffer(cl_mem buffer, const void* host_ptr, size_t nbytes);

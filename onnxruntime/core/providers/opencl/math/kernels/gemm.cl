@@ -43,30 +43,29 @@ __kernel void Gemm_Float(
 // ---------------------------------------------------------------------------
 // Tiled, register-blocked GEMM: C[M,N] = A[M,K] @ B[K,N] (both row-major).
 //
-// Used by Conv (im2col + GEMM) and ConvTranspose (GEMM + col2im), which is
-// where the vocoder spends its time. The naive Gemm_Float above is a scalar
-// loop with no data reuse; this one stages a GEMM_BM x GEMM_BK tile of A and a
-// GEMM_BK x GEMM_BN tile of B in local memory and computes a GEMM_TM x GEMM_TN
-// register tile per work-item, so each loaded element feeds many FMAs.
+// Used by Conv (im2col + GEMM) and ConvTranspose (GEMM + col2im). The naive
+// Gemm_Float above is a scalar loop with no data reuse; this one stages a
+// GEMM_BM x GEMM_BK tile of A and a GEMM_BK x GEMM_BN tile of B in local
+// memory and computes a GEMM_TM x GEMM_TN register tile per work-item.
 //
-// Tried and rejected (measured on the A51 Mali-G76, all slower than this form):
-// a no-local-memory register variant (~2x slower — __local reuse matters), and
-// padding the local tiles against bank conflicts + #pragma unroll (~1.4x
-// slower — the extra __local hurt more than the conflicts).
+// Two implementations, chosen by the EP's `use_fp16` flag (see the conv hosts):
+//   Gemm_Tiled      - fp32 local tiles, fp32 MAC + fp32 accumulate (default).
+//   Gemm_Tiled_F16  - half local tiles, packed half2 MAC, half2 accumulate.
 //
-// Layout: work-item (lx,ly) owns the GEMM_TN columns at col0+lx*GEMM_TN and the
-// GEMM_TM rows at row0+ly*GEMM_TM; the tile loads are coalesced. The host passes
-// the matching local work size (GEMM_BN/GEMM_TN, GEMM_BM/GEMM_TM) and pads the
-// global range to a multiple of it.
+// Both grid-stride over the N tiles: the grid is capped to the device's
+// CL_DEVICE_MAX_WORK_ITEM_SIZES[0] (Mali tolerates a huge per-dimension global
+// work size; Adreno does not, and schedules it pathologically), so a work-group
+// may own several N tiles. The host launches
+// (min(numNtiles, cap/(GEMM_BN/GEMM_TN)) * (GEMM_BN/GEMM_TN), numMtiles * (GEMM_BM/GEMM_TM)).
 //
-// NOTE: these tile sizes are tuned for Mali (the A51 G76) and are compile-time
-// constants, so they are the one device-specific choice here. The algorithms
-// (im2col/GEMM/col2im) are generic. If this is used on Adreno, prefer selecting
-// the tile by GpuType (the EP already models MALI vs ADRENO) rather than a new
-// EP name.
+// Tried and rejected: a no-local-memory register variant (~3x slower), padded
+// local tiles + #pragma unroll (~1.4x slower), and an fp16 variant that flushed
+// to an fp32 accumulator every GEMM_BK step (~1.8x slower than the half2 form).
+//
+// Tile sizes are the one device-tuned choice; the algorithms are generic.
 #define GEMM_BM 64
 #define GEMM_BN 64
-#define GEMM_BK 16
+#define GEMM_BK 32
 #define GEMM_TM 4
 #define GEMM_TN 4
 
@@ -87,48 +86,130 @@ void Gemm_Tiled(
   __local float Bs[GEMM_BK][GEMM_BN];
 
   const int row0 = get_group_id(1) * GEMM_BM;
-  const int col0 = get_group_id(0) * GEMM_BN;
+  const int numNtiles = (N + GEMM_BN - 1) / GEMM_BN;
 
-  float acc[GEMM_TM][GEMM_TN];
-  for (int i = 0; i < GEMM_TM; ++i)
-    for (int j = 0; j < GEMM_TN; ++j)
-      acc[i][j] = 0.0f;
+  for (int nt = get_group_id(0); nt < numNtiles; nt += get_num_groups(0)) {
+    const int col0 = nt * GEMM_BN;
 
-  for (int k0 = 0; k0 < K; k0 += GEMM_BK) {
-    for (int idx = tid; idx < GEMM_BM * GEMM_BK; idx += nthreads) {
-      const int i = idx / GEMM_BK;
-      const int kk = idx % GEMM_BK;
-      const int gr = row0 + i;
-      const int gk = k0 + kk;
-      As[i][kk] = (gr < M && gk < K) ? A[gr * K + gk] : 0.0f;
+    float acc[GEMM_TM][GEMM_TN];
+    for (int i = 0; i < GEMM_TM; ++i)
+      for (int j = 0; j < GEMM_TN; ++j)
+        acc[i][j] = 0.0f;
+
+    for (int k0 = 0; k0 < K; k0 += GEMM_BK) {
+      for (int idx = tid; idx < GEMM_BM * GEMM_BK; idx += nthreads) {
+        const int i = idx / GEMM_BK;
+        const int kk = idx % GEMM_BK;
+        const int gr = row0 + i;
+        const int gk = k0 + kk;
+        As[i][kk] = (gr < M && gk < K) ? A[gr * K + gk] : 0.0f;
+      }
+      for (int idx = tid; idx < GEMM_BK * GEMM_BN; idx += nthreads) {
+        const int kk = idx / GEMM_BN;
+        const int j = idx % GEMM_BN;
+        const int gk = k0 + kk;
+        const int gc = col0 + j;
+        Bs[kk][j] = (gk < K && gc < N) ? B[gk * N + gc] : 0.0f;
+      }
+      barrier(CLK_LOCAL_MEM_FENCE);
+
+      for (int kk = 0; kk < GEMM_BK; ++kk) {
+        float a[GEMM_TM];
+        float b[GEMM_TN];
+        for (int i = 0; i < GEMM_TM; ++i) a[i] = As[ly * GEMM_TM + i][kk];
+        for (int j = 0; j < GEMM_TN; ++j) b[j] = Bs[kk][lx * GEMM_TN + j];
+        for (int i = 0; i < GEMM_TM; ++i)
+          for (int j = 0; j < GEMM_TN; ++j)
+            acc[i][j] += a[i] * b[j];
+      }
+      barrier(CLK_LOCAL_MEM_FENCE);
     }
-    for (int idx = tid; idx < GEMM_BK * GEMM_BN; idx += nthreads) {
-      const int kk = idx / GEMM_BN;
-      const int j = idx % GEMM_BN;
-      const int gk = k0 + kk;
-      const int gc = col0 + j;
-      Bs[kk][j] = (gk < K && gc < N) ? B[gk * N + gc] : 0.0f;
+
+    for (int i = 0; i < GEMM_TM; ++i) {
+      const int gr = row0 + ly * GEMM_TM + i;
+      if (gr >= M) continue;
+      for (int j = 0; j < GEMM_TN; ++j) {
+        const int gc = col0 + lx * GEMM_TN + j;
+        if (gc < N) C[gr * N + gc] = acc[i][j];
+      }
     }
     barrier(CLK_LOCAL_MEM_FENCE);
-
-    for (int kk = 0; kk < GEMM_BK; ++kk) {
-      float a[GEMM_TM];
-      float b[GEMM_TN];
-      for (int i = 0; i < GEMM_TM; ++i) a[i] = As[ly * GEMM_TM + i][kk];
-      for (int j = 0; j < GEMM_TN; ++j) b[j] = Bs[kk][lx * GEMM_TN + j];
-      for (int i = 0; i < GEMM_TM; ++i)
-        for (int j = 0; j < GEMM_TN; ++j)
-          acc[i][j] += a[i] * b[j];
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-  }
-
-  for (int i = 0; i < GEMM_TM; ++i) {
-    const int gr = row0 + ly * GEMM_TM + i;
-    if (gr >= M) continue;
-    for (int j = 0; j < GEMM_TN; ++j) {
-      const int gc = col0 + lx * GEMM_TN + j;
-      if (gc < N) C[gr * N + gc] = acc[i][j];
-    }
   }
 }
+
+#if defined(cl_khr_fp16)
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+
+// fp16 variant: half local tiles, packed half2 MAC and half2 accumulate. The
+// half2 accumulator is converted to fp32 only when the result is stored, so the
+// whole reduction accumulates in fp16.
+__kernel __attribute__((reqd_work_group_size(GEMM_BN / GEMM_TN, GEMM_BM / GEMM_TM, 1)))
+void Gemm_Tiled_F16(
+    const int M,
+    const int N,
+    const int K,
+    __global const float* A,
+    __global const float* B,
+    __global float* C) {
+  const int lx = get_local_id(0);
+  const int ly = get_local_id(1);
+  const int tid = ly * get_local_size(0) + lx;
+  const int nthreads = get_local_size(0) * get_local_size(1);
+
+  __local half As[GEMM_BM][GEMM_BK];
+  __local half Bs[GEMM_BK][GEMM_BN];
+
+  const int row0 = get_group_id(1) * GEMM_BM;
+  const int numNtiles = (N + GEMM_BN - 1) / GEMM_BN;
+
+  for (int nt = get_group_id(0); nt < numNtiles; nt += get_num_groups(0)) {
+    const int col0 = nt * GEMM_BN;
+
+    half2 acc2[GEMM_TM][GEMM_TN / 2];
+    for (int i = 0; i < GEMM_TM; ++i)
+      for (int j2 = 0; j2 < GEMM_TN / 2; ++j2)
+        acc2[i][j2] = (half2)(0.0f, 0.0f);
+
+    for (int k0 = 0; k0 < K; k0 += GEMM_BK) {
+      for (int idx = tid; idx < GEMM_BM * GEMM_BK; idx += nthreads) {
+        const int i = idx / GEMM_BK;
+        const int kk = idx % GEMM_BK;
+        const int gr = row0 + i;
+        const int gk = k0 + kk;
+        As[i][kk] = (half)((gr < M && gk < K) ? A[gr * K + gk] : 0.0f);
+      }
+      for (int idx = tid; idx < GEMM_BK * GEMM_BN; idx += nthreads) {
+        const int kk = idx / GEMM_BN;
+        const int j = idx % GEMM_BN;
+        const int gk = k0 + kk;
+        const int gc = col0 + j;
+        Bs[kk][j] = (half)((gk < K && gc < N) ? B[gk * N + gc] : 0.0f);
+      }
+      barrier(CLK_LOCAL_MEM_FENCE);
+
+      for (int kk = 0; kk < GEMM_BK; ++kk) {
+        half a[GEMM_TM];
+        for (int i = 0; i < GEMM_TM; ++i) a[i] = As[ly * GEMM_TM + i][kk];
+        for (int j2 = 0; j2 < GEMM_TN / 2; ++j2) {
+          const int jc = lx * GEMM_TN + 2 * j2;
+          const half2 b2 = (half2)(Bs[kk][jc], Bs[kk][jc + 1]);
+          for (int i = 0; i < GEMM_TM; ++i)
+            acc2[i][j2] = (half2)(a[i], a[i]) * b2 + acc2[i][j2];
+        }
+      }
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    for (int i = 0; i < GEMM_TM; ++i) {
+      const int gr = row0 + ly * GEMM_TM + i;
+      if (gr >= M) continue;
+      for (int j2 = 0; j2 < GEMM_TN / 2; ++j2) {
+        const int gc = col0 + lx * GEMM_TN + 2 * j2;
+        if (gc < N) C[gr * N + gc] = (float)acc2[i][j2].lo;
+        if (gc + 1 < N) C[gr * N + gc + 1] = (float)acc2[i][j2].hi;
+      }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+}
+#endif

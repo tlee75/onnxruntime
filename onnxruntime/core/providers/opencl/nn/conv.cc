@@ -3,6 +3,7 @@
 
 #include "conv.h"
 
+#include <algorithm>
 #include <vector>
 
 #include "core/providers/opencl/opencl_kernel.h"
@@ -47,6 +48,16 @@ class Conv : public OpenCLKernel {
     LoadKernel("Conv_Im2col");
     LoadKernel("Conv_AddBias");
     LoadKernel("Gemm_Tiled");
+    LoadKernel("Gemm_Tiled_Conv");
+    LoadKernel("Gemm_Tiled_Conv_BM32");
+    LoadKernel("Gemm_Tiled_Conv_BM16");
+    if (exec_->SupportsFp16()) LoadKernel("Gemm_Tiled_F16");
+  }
+
+  // The GEMM kernel to use: the fp16 variant when the device supports it AND the
+  // session asked for fp16 (addOpenCL(useFp16, …)); otherwise the fp32 one.
+  const char* GemmKernel() const {
+    return (exec_->SupportsFp16() && exec_->UseFp16()) ? "Gemm_Tiled_F16" : "Gemm_Tiled";
   }
 
   Status Compute(OpKernelContext* context) const override {
@@ -81,48 +92,58 @@ class Conv : public OpenCLKernel {
       const int m_i = static_cast<int>(M);
       const int wout_i = static_cast<int>(Wout);
       const int kdim = c_i * k_i;
+      // Per-dimension global work size cap (Adreno rejects huge per-dim sizes;
+      // the kernels grid-stride over Wout).
+      const size_t cap0 = exec_->MaxWorkItemSize(0);
 
       cl_mem a = CL_BUFFER_FROM_TENSOR(*Wt);  // [M, C*K] row-major
+      cl_mem x = CL_BUFFER_FROM_TENSOR(*X);   // [C, W]
       cl_mem y = CL_BUFFER_FROM_TENSOR(*Y);
-      cl_mem b = nullptr;
-      bool own_b = false;
-      if (k_i == 1 && stride == 1 && pad_l == 0) {
-        // 1x1 conv: X is already [C, W] == [Kdim, Wout]; no unfold needed.
-        b = CL_BUFFER_FROM_TENSOR(*X);
-      } else {
-        b = exec_->GetScratchBufferTmp(static_cast<size_t>(kdim) * wout_i * sizeof(float));
-        own_b = true;
-        ORT_RETURN_IF_ERROR(
-            KernelLauncher{GetKernel("Conv_Im2col")}
-                .SetArg<cl_int>(c_i)
-                .SetArg<cl_int>(w_i)
-                .SetArg<cl_int>(k_i)
-                .SetArg<cl_int>(wout_i)
-                .SetArg<cl_int>(static_cast<cl_int>(stride))
-                .SetArg<cl_int>(static_cast<cl_int>(pad_l))
-                .SetArg<cl_int>(static_cast<cl_int>(dilation))
-                .SetBuffer(CL_BUFFER_FROM_TENSOR(*X))
-                .SetBuffer(b)
-                .Launch(*exec_, NDRange(static_cast<size_t>(wout_i), static_cast<size_t>(kdim))));
-      }
 
-      // Y[M, Wout] = W[M, Kdim] @ col[Kdim, Wout]
+      // Y[M, Wout] = W[M, Kdim] @ im2col(X)
       const size_t lx = kGemmBN / kGemmTN;
       const size_t ly = kGemmBM / kGemmTM;
       const size_t gn = (static_cast<size_t>(wout_i) + kGemmBN - 1) / kGemmBN;
       const size_t gm = (static_cast<size_t>(m_i) + kGemmBM - 1) / kGemmBM;
-      ORT_RETURN_IF_ERROR(
-          KernelLauncher{GetKernel("Gemm_Tiled")}
-              .SetArg<cl_int>(m_i)
-              .SetArg<cl_int>(wout_i)
-              .SetArg<cl_int>(kdim)
-              .SetBuffer(a)
-              .SetBuffer(b)
-              .SetBuffer(y)
-              .Launch(*exec_, NDRange(gn * lx, gm * ly), NDRange(lx, ly)));
+      const size_t gn_used = std::min(gn, std::max<size_t>(1, cap0 / lx));
 
-      if (own_b) {
-        exec_->ReleaseCLBuffer(b);
+      if (k_i == 1 && stride == 1 && pad_l == 0) {
+        // 1x1 conv: X is already [C, W] == [Kdim, Wout]; a plain GEMM.
+        ORT_RETURN_IF_ERROR(
+            KernelLauncher{GetKernel(GemmKernel())}
+                .SetArg<cl_int>(m_i)
+                .SetArg<cl_int>(wout_i)
+                .SetArg<cl_int>(kdim)
+                .SetBuffer(a)
+                .SetBuffer(x)
+                .SetBuffer(y)
+                .Launch(*exec_, NDRange(gn_used * lx, gm * ly), NDRange(lx, ly)));
+      } else {
+        // General conv: fuse im2col into the GEMM. The conv GEMM is short and
+        // wide (tiny M, huge Wout), so pick a small-BM variant whose tile wastes
+        // fewer padded rows. The local size MUST match that variant's tile.
+        const size_t bm = (m_i <= 16) ? 16u : (m_i <= 32 ? 32u : 64u);
+        const char* kn = (bm == 16) ? "Gemm_Tiled_Conv_BM16"
+                                    : (bm == 32 ? "Gemm_Tiled_Conv_BM32" : "Gemm_Tiled_Conv");
+        const size_t flx = kGemmBN / kGemmTN;
+        const size_t fly = bm / kGemmTM;
+        const size_t fgm = (static_cast<size_t>(m_i) + bm - 1) / bm;
+        const size_t fgn = (static_cast<size_t>(wout_i) + kGemmBN - 1) / kGemmBN;
+        const size_t fgn_used = std::min(fgn, std::max<size_t>(1, cap0 / flx));
+        ORT_RETURN_IF_ERROR(
+            KernelLauncher{GetKernel(kn)}
+                .SetArg<cl_int>(m_i)
+                .SetArg<cl_int>(wout_i)
+                .SetArg<cl_int>(c_i)
+                .SetArg<cl_int>(w_i)
+                .SetArg<cl_int>(k_i)
+                .SetArg<cl_int>(static_cast<cl_int>(stride))
+                .SetArg<cl_int>(static_cast<cl_int>(pad_l))
+                .SetArg<cl_int>(static_cast<cl_int>(dilation))
+                .SetBuffer(a)
+                .SetBuffer(x)
+                .SetBuffer(y)
+                .Launch(*exec_, NDRange(fgn_used * flx, fgm * fly), NDRange(flx, fly)));
       }
 
       if (has_bias) {
@@ -132,7 +153,8 @@ class Conv : public OpenCLKernel {
                 .SetArg<cl_int>(m_i)
                 .SetBuffer(y)
                 .SetBuffer(bias)
-                .Launch(*exec_, NDRange(static_cast<size_t>(wout_i), static_cast<size_t>(m_i))));
+                .Launch(*exec_, NDRange(std::min<size_t>(static_cast<size_t>(wout_i), cap0),
+                                        static_cast<size_t>(m_i))));
       }
       return Status::OK();
     }
