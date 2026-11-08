@@ -245,14 +245,8 @@ Status KernelLauncher::Launch(const OpenCLExecutionProvider& exec, const NDRange
     TracyCLNamedZoneSetEvent(_tracy_cl_launch, kernel_launch_event);
   }
 #else
-  const auto _t0 = std::chrono::steady_clock::now();
-  cl_event _ev = nullptr;
   ORT_RETURN_IF_CL_ERROR(clEnqueueNDRangeKernel(exec.GetCommandQueue(), kernel_, global_.Size(), nullptr,
-                                                global_.Data(), local_.Data(), 0, nullptr, &_ev));
-  const auto _t1 = std::chrono::steady_clock::now();
-  const_cast<OpenCLExecutionProvider&>(exec).ProfRecord(
-      GetKernelFunctionName().c_str(), _ev,
-      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(_t1 - _t0).count()));
+                                                global_.Data(), local_.Data(), 0, nullptr, nullptr));
 #endif
   return exec.AfterCLLaunch();
 }
