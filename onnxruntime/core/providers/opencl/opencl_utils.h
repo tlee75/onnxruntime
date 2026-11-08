@@ -439,6 +439,14 @@ class KernelLauncher {
 
   Status Launch(const OpenCLExecutionProvider& exec, const NDRange& global, const NDRange& local = {});
 
+  /// Time THIS kernel (already bound with its arguments) on the EP's tuning
+  /// command queue: a few enqueues with profiling events, averaged, in
+  /// microseconds. Used to choose between kernel *variants* (e.g. which
+  /// register-tile a fused conv should use) the same way DefaultLocalWG2DOrTune
+  /// chooses a local work size. Returns `double` max on any OpenCL error, so a
+  /// broken candidate simply never wins.
+  double TimeOnTuneQueue(const OpenCLExecutionProvider& exec, const NDRange& global, const NDRange& local) const;
+
  private:
   inline std::string GetKernelFunctionName() {
     size_t ret_size;

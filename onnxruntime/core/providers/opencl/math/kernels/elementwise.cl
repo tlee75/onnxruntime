@@ -183,34 +183,34 @@ DEFINE_LOGICOP_KERNEL(uchar, bool, equal, EQUAL_OP)
 #define DEFINE_OP_FAST_KERNELS(type, type_suffix, op_name, operation)      \
   __kernel void op_name##_##type_suffix##_lin(                             \
       __global type* A, __global type* B, __global type* C) {              \
-    int gid = get_global_id(0);                                            \
+    long gid = get_global_id(0); /* no index math here, so 64-bit is free */ \
     C[gid] = operation(A[gid], B[gid]);                                    \
   }                                                                        \
   __kernel void op_name##_##type_suffix##_scalar_a(                        \
       __global type* A, __global type* B, __global type* C) {              \
-    int gid = get_global_id(0);                                            \
+    long gid = get_global_id(0); /* no index math here, so 64-bit is free */ \
     C[gid] = operation(A[0], B[gid]);                                      \
   }                                                                        \
   __kernel void op_name##_##type_suffix##_scalar_b(                        \
       __global type* A, __global type* B, __global type* C) {              \
-    int gid = get_global_id(0);                                            \
+    long gid = get_global_id(0); /* no index math here, so 64-bit is free */ \
     C[gid] = operation(A[gid], B[0]);                                      \
   }
 
 #define DEFINE_LOGICOP_FAST_KERNELS(type, type_suffix, op_name, operation) \
   __kernel void op_name##_##type_suffix##_lin(                             \
       __global type* A, __global type* B, __global uchar* C) {             \
-    int gid = get_global_id(0);                                            \
+    long gid = get_global_id(0); /* no index math here, so 64-bit is free */ \
     C[gid] = operation(A[gid], B[gid]);                                    \
   }                                                                        \
   __kernel void op_name##_##type_suffix##_scalar_a(                        \
       __global type* A, __global type* B, __global uchar* C) {             \
-    int gid = get_global_id(0);                                            \
+    long gid = get_global_id(0); /* no index math here, so 64-bit is free */ \
     C[gid] = operation(A[0], B[gid]);                                      \
   }                                                                        \
   __kernel void op_name##_##type_suffix##_scalar_b(                        \
       __global type* A, __global type* B, __global uchar* C) {             \
-    int gid = get_global_id(0);                                            \
+    long gid = get_global_id(0); /* no index math here, so 64-bit is free */ \
     C[gid] = operation(A[gid], B[0]);                                      \
   }
 

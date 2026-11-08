@@ -67,13 +67,17 @@ TensorShape broadcast_shape(const TensorShape& shape1, const TensorShape& shape2
       auto* b = context->Input<Tensor>(1);                                                                              \
       TensorShape out_shape = broadcast_shape(a->Shape(), b->Shape());                                                  \
       auto* c = context->Output(0, out_shape);                                                                          \
-      ORT_ENFORCE(c->Shape().Size() <= static_cast<int64_t>(std::numeric_limits<int>::max()),                             \
-                  "Elementwise: tensor too large for the OpenCL EP's 32-bit indexing");\
       if ((a->Shape() == out_shape && b->Shape() == out_shape) || b->Shape().Size() == 1 || a->Shape().Size() == 1) {\
         const std::string _kn = (a->Shape() == out_shape && b->Shape() == out_shape) ? #CLASS_NAME "_lin" : (b->Shape().Size() == 1 ? #CLASS_NAME "_scalar_b" : #CLASS_NAME "_scalar_a");\
         ORT_RETURN_IF_ERROR(KernelLauncher{GetKernel(_kn)}.SetBuffers(*a, *b, *c).Launch(*exec_, {static_cast<size_t>(out_shape.Size()), 1, 1}));\
         return Status::OK();\
       }  \
+      /* Only the broadcast kernel decomposes the flat index in 32-bit (a      \
+         32-bit divide is what keeps the fast paths fast on Adreno); it needs  \
+         the element count to fit int. The fast paths index in 64-bit and have \
+         no such limit. */                                                    \
+      ORT_ENFORCE(c->Shape().Size() <= static_cast<int64_t>(std::numeric_limits<int>::max()),                             \
+                  "Elementwise: tensor too large for the OpenCL EP's 32-bit indexing");\
       const size_t Shape_sIze = 5 * sizeof(int);                                                                                              \
       cl_mem A_Shape = nullptr;                                                            \
       cl_mem B_Shape = nullptr;                                                            \
@@ -166,13 +170,17 @@ ONNX_OPERATOR_VERSIONED_KERNEL_EX(
       auto* b = context->Input<Tensor>(1);                                                                              \
       TensorShape out_shape = broadcast_shape(a->Shape(), b->Shape());                                                  \
       auto* c = context->Output(0, out_shape);                                                                          \
-      ORT_ENFORCE(c->Shape().Size() <= static_cast<int64_t>(std::numeric_limits<int>::max()),                             \
-                  "Elementwise: tensor too large for the OpenCL EP's 32-bit indexing");\
       if ((a->Shape() == out_shape && b->Shape() == out_shape) || b->Shape().Size() == 1 || a->Shape().Size() == 1) {\
         const std::string _kn = (a->Shape() == out_shape && b->Shape() == out_shape) ? #CLASS_NAME "_lin" : (b->Shape().Size() == 1 ? #CLASS_NAME "_scalar_b" : #CLASS_NAME "_scalar_a");\
         ORT_RETURN_IF_ERROR(KernelLauncher{GetKernel(_kn)}.SetBuffers(*a, *b, *c).Launch(*exec_, {static_cast<size_t>(out_shape.Size()), 1, 1}));\
         return Status::OK();\
       }  \
+      /* Only the broadcast kernel decomposes the flat index in 32-bit (a      \
+         32-bit divide is what keeps the fast paths fast on Adreno); it needs  \
+         the element count to fit int. The fast paths index in 64-bit and have \
+         no such limit. */                                                    \
+      ORT_ENFORCE(c->Shape().Size() <= static_cast<int64_t>(std::numeric_limits<int>::max()),                             \
+                  "Elementwise: tensor too large for the OpenCL EP's 32-bit indexing");\
       const size_t Shape_sIze = 5 * sizeof(int);                                                                                              \
       cl_mem A_Shape = nullptr;                                                            \
       cl_mem B_Shape = nullptr;                                                            \

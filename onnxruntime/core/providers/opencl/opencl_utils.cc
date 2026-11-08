@@ -148,6 +148,38 @@ const char* GetErrorString(cl_int error_code) {
     return double(ULONG_MAX);                        \
   }
 
+double KernelLauncher::TimeOnTuneQueue(const OpenCLExecutionProvider& exec, const NDRange& global, const NDRange& local) const {
+  constexpr int kRuns = 5;
+  // A smoke run first: an unsupported local size errors here (so the candidate
+  // is rejected) instead of poisoning the queue below.
+  if (clEnqueueNDRangeKernel(exec.GetCommandQueueForTune(), kernel_, global.Size(), nullptr,
+                             global.Data(), local.Data(), 0, nullptr, nullptr) != CL_SUCCESS) {
+    return std::numeric_limits<double>::max();
+  }
+  std::vector<cl_event> events(kRuns, nullptr);
+  for (int r = 0; r < kRuns; ++r) {
+    if (clEnqueueNDRangeKernel(exec.GetCommandQueueForTune(), kernel_, global.Size(), nullptr,
+                               global.Data(), local.Data(), 0, nullptr, &events[r]) != CL_SUCCESS) {
+      for (int i = 0; i < r; ++i) clReleaseEvent(events[i]);
+      return std::numeric_limits<double>::max();
+    }
+  }
+  double total_us = 0.0;
+  if (clWaitForEvents(kRuns, events.data()) == CL_SUCCESS) {
+    for (int r = 0; r < kRuns; ++r) {
+      cl_ulong begin = 0, end = 0;
+      if (clGetEventProfilingInfo(events[r], CL_PROFILING_COMMAND_START, sizeof(begin), &begin, nullptr) == CL_SUCCESS &&
+          clGetEventProfilingInfo(events[r], CL_PROFILING_COMMAND_END, sizeof(end), &end, nullptr) == CL_SUCCESS) {
+        total_us += static_cast<double>(end - begin) / 1000.0;
+      }
+    }
+  } else {
+    total_us = std::numeric_limits<double>::max() * static_cast<double>(kRuns);
+  }
+  for (int r = 0; r < kRuns; ++r) clReleaseEvent(events[r]);
+  return total_us / kRuns;
+}
+
 Status KernelLauncher::Launch(const OpenCLExecutionProvider& exec, const NDRange& global, const NDRange& local) {
   ORT_RETURN_IF_CL_ERROR(err_, " on setting argument ", static_cast<int>(err_index_));
   LOGS_DEFAULT(VERBOSE) << "Launching " << GetKernelFunctionName()

@@ -4,6 +4,10 @@
 #include "conv.h"
 
 #include <algorithm>
+#include <array>
+#include <limits>
+#include <map>
+#include <mutex>
 #include <vector>
 
 #include "core/providers/opencl/opencl_kernel.h"
@@ -92,6 +96,11 @@ class Conv : public OpenCLKernel {
     const int has_bias = (B != nullptr) ? 1 : 0;
 
     if (group_ == 1 && N == 1) {
+      // The conv kernels index in 32-bit; a dimension is never remotely near int,
+      // but fail loudly rather than silently truncate through the casts below.
+      const int64_t imax = std::numeric_limits<int>::max();
+      ORT_ENFORCE(C <= imax && W <= imax && K <= imax && M <= imax && Wout <= imax,
+                  "Conv: a dimension exceeds the OpenCL EP's 32-bit indexing");
       const int c_i = static_cast<int>(C);
       const int w_i = static_cast<int>(W);
       const int k_i = static_cast<int>(K);
@@ -128,41 +137,34 @@ class Conv : public OpenCLKernel {
                 .SetBuffer(bias)
                 .Launch(*exec_, NDRange(gn_used * lx, gm * ly), NDRange(lx, ly)));
       } else {
-        // General conv: fuse im2col into the GEMM. The conv GEMM is short and
-        // wide, so pick a tile that fills the grid: a small BM when M is tiny
-        // (wastes fewer padded rows), a narrow BN when Wout is small (more
-        // N-tiles => more work-groups). The local size MUST match the variant.
-        const size_t bm = (m_i <= 16) ? 16u : (m_i <= 32 ? 32u : 64u);
-        const size_t bn = (bm == 64 && wout_i <= 128) ? 32u : 64u;
-        // Pick the fp16 twin when the device supports fp16 and the session
-        // asked for it; the fp16 kernels use half the local memory (better
-        // occupancy) and half2 MAC.
+        // General conv: fuse im2col into the GEMM.
+        //
+        // BM/BN set BOTH the register tile and the work-group shape (each
+        // variant declares reqd_work_group_size), so choosing a tile means
+        // choosing a kernel. The default below is the measured sweet spot for
+        // this family of conv shapes; because that is a shape/device-tuned
+        // choice rather than a derivation, `enableAutoTune` TIMES the
+        // candidates on the first call for a shape and caches the winner --
+        // other consumers do not have to trust the defaults.
+        //
+        // The fp16 twin is used when the device supports fp16 and the session
+        // asked for it (half the local memory => better occupancy, half2 MAC).
         const bool f16 = exec_->SupportsFp16() && exec_->UseFp16();
-        const char* kn = (bm == 16) ? (f16 ? "Gemm_Tiled_Conv_BM16_F16" : "Gemm_Tiled_Conv_BM16")
-                                    : (bm == 32 ? (f16 ? "Gemm_Tiled_Conv_BM32_F16" : "Gemm_Tiled_Conv_BM32")
-                                                : (bn == 32 ? (f16 ? "Gemm_Tiled_Conv_BN32_F16" : "Gemm_Tiled_Conv_BN32")
-                                                            : (f16 ? "Gemm_Tiled_Conv_F16" : "Gemm_Tiled_Conv")));
-        const size_t flx = bn / kGemmTN;
-        const size_t fly = bm / kGemmTM;
-        const size_t fgm = (static_cast<size_t>(m_i) + bm - 1) / bm;
-        const size_t fgn = (static_cast<size_t>(wout_i) + bn - 1) / bn;
+        const ConvTile tile = ChooseConvTile(m_i, wout_i, cap0, f16, a, x, y, bias,
+                                             c_i, w_i, k_i, static_cast<int>(stride),
+                                             static_cast<int>(pad_l),
+                                             static_cast<int>(dilation), has_bias);
+        const size_t flx = tile.bn / kGemmTN;
+        const size_t fly = tile.bm / kGemmTM;
+        const size_t fgm = (static_cast<size_t>(m_i) + tile.bm - 1) / tile.bm;
+        const size_t fgn = (static_cast<size_t>(wout_i) + tile.bn - 1) / tile.bn;
         const size_t fgn_used = std::min(fgn, std::max<size_t>(1, cap0 / flx));
+        KernelLauncher kl{GetKernel(ConvTileKernel(tile, f16))};
+        BindConvGemm(kl, a, x, y, bias, m_i, wout_i, c_i, w_i, k_i,
+                     static_cast<int>(stride), static_cast<int>(pad_l),
+                     static_cast<int>(dilation), has_bias);
         ORT_RETURN_IF_ERROR(
-            KernelLauncher{GetKernel(kn)}
-                .SetArg<cl_int>(m_i)
-                .SetArg<cl_int>(wout_i)
-                .SetArg<cl_int>(c_i)
-                .SetArg<cl_int>(w_i)
-                .SetArg<cl_int>(k_i)
-                .SetArg<cl_int>(static_cast<cl_int>(stride))
-                .SetArg<cl_int>(static_cast<cl_int>(pad_l))
-                .SetArg<cl_int>(static_cast<cl_int>(dilation))
-                .SetArg<cl_int>(has_bias)
-                .SetBuffer(a)
-                .SetBuffer(x)
-                .SetBuffer(y)
-                .SetBuffer(bias)
-                .Launch(*exec_, NDRange(fgn_used * flx, fgm * fly), NDRange(flx, fly)));
+            kl.Launch(*exec_, NDRange(fgn_used * flx, fgm * fly), NDRange(flx, fly)));
       }
       return Status::OK();
     }
@@ -190,11 +192,96 @@ class Conv : public OpenCLKernel {
     return Status::OK();
   }
 
+
+  // A fused-conv GEMM tile. The kernel is implied by (bm, bn, fp16).
+  struct ConvTile {
+    size_t bm, bn;
+  };
+
+  static const char* ConvTileKernel(const ConvTile& t, bool f16) {
+    if (t.bm == 16) return f16 ? "Gemm_Tiled_Conv_BM16_F16" : "Gemm_Tiled_Conv_BM16";
+    if (t.bm == 32) return f16 ? "Gemm_Tiled_Conv_BM32_F16" : "Gemm_Tiled_Conv_BM32";
+    if (t.bn == 32) return f16 ? "Gemm_Tiled_Conv_BN32_F16" : "Gemm_Tiled_Conv_BN32";
+    return f16 ? "Gemm_Tiled_Conv_F16" : "Gemm_Tiled_Conv";
+  }
+
+  static void BindConvGemm(KernelLauncher& kl, cl_mem a, cl_mem x, cl_mem y, cl_mem bias,
+                           int m_i, int wout_i, int c_i, int w_i, int k_i,
+                           int stride, int pad_l, int dilation, int has_bias) {
+    kl.SetArg<cl_int>(m_i)
+        .SetArg<cl_int>(wout_i)
+        .SetArg<cl_int>(c_i)
+        .SetArg<cl_int>(w_i)
+        .SetArg<cl_int>(k_i)
+        .SetArg<cl_int>(stride)
+        .SetArg<cl_int>(pad_l)
+        .SetArg<cl_int>(dilation)
+        .SetArg<cl_int>(has_bias)
+        .SetBuffer(a)
+        .SetBuffer(x)
+        .SetBuffer(y)
+        .SetBuffer(bias);
+  }
+
+  // Pick the fused-conv GEMM tile: the default heuristic, or -- with
+  // enableAutoTune -- whichever of the candidates is fastest for this shape
+  // (timed once per shape and cached).
+  ConvTile ChooseConvTile(int m_i, int wout_i, size_t cap0, bool f16,
+                          cl_mem a, cl_mem x, cl_mem y, cl_mem bias,
+                          int c_i, int w_i, int k_i, int stride, int pad_l, int dilation,
+                          int has_bias) const {
+    // Default: BM is the smallest tile that still covers M (so no accumulator row
+    // is padded away); BN halves to 32 when a full-width tile would leave the grid
+    // too thin to fill the device. Both were measured on Mali-G76 and Adreno 740.
+    const ConvTile fallback = (m_i <= 16) ? ConvTile{16, 64}
+                                          : (m_i <= 32 ? ConvTile{32, 64}
+                                                       : ConvTile{64, wout_i <= 128 ? 32u : 64u});
+    if (!exec_->TuneEnabledLevel()) {
+      return fallback;
+    }
+
+    static constexpr ConvTile kCandidates[] = {{64, 64}, {32, 64}, {16, 64}, {64, 32}};
+    const std::array<int, 4> key{m_i, wout_i, c_i * k_i, f16 ? 1 : 0};
+    {
+      std::lock_guard<std::mutex> guard(tile_mu_);
+      auto it = tile_choice_.find(key);
+      if (it != tile_choice_.end()) {
+        return ConvTile{it->second[0], it->second[1]};
+      }
+    }
+
+    ConvTile best = fallback;
+    double best_us = std::numeric_limits<double>::max();
+    for (const ConvTile& t : kCandidates) {
+      const size_t flx = t.bn / kGemmTN;
+      const size_t fly = t.bm / kGemmTM;
+      const size_t fgm = (static_cast<size_t>(m_i) + t.bm - 1) / t.bm;
+      const size_t fgn = (static_cast<size_t>(wout_i) + t.bn - 1) / t.bn;
+      const size_t fgn_used = std::min(fgn, std::max<size_t>(1, cap0 / flx));
+      KernelLauncher kl{GetKernel(ConvTileKernel(t, f16))};
+      BindConvGemm(kl, a, x, y, bias, m_i, wout_i, c_i, w_i, k_i, stride, pad_l, dilation, has_bias);
+      const double us = kl.TimeOnTuneQueue(*exec_, NDRange(fgn_used * flx, fgm * fly), NDRange(flx, fly));
+      if (us < best_us) {
+        best_us = us;
+        best = t;
+      }
+    }
+    {
+      std::lock_guard<std::mutex> guard(tile_mu_);
+      tile_choice_[key] = {best.bm, best.bn};
+    }
+    return best;
+  }
+
  private:
   int64_t group_ = 1;
   std::vector<int64_t> strides_;
   std::vector<int64_t> pads_;
   std::vector<int64_t> dilations_;
+
+  // enableAutoTune: chosen fused-conv tile per (M, Wout, Kdim, fp16).
+  mutable std::mutex tile_mu_;
+  mutable std::map<std::array<int, 4>, std::array<size_t, 2>> tile_choice_;
 };
 
 ONNX_OPENCL_OPERATOR_KERNEL(
