@@ -43,8 +43,11 @@ namespace onnxruntime {
 
 // Information needed to construct OpenCL execution providers.
 struct OpenCLExecutionProviderInfo {
-  bool use_fp16;
-  int32_t auto_runing_level;
+  // Defaults matter: a consumer that constructs this struct directly (instead of
+  // going through CreateExecutionProviderFactory_OpenCL) must still get the
+  // documented defaults -- fp32 (fp16 is opt-in) and no auto-tuning.
+  bool use_fp16 = false;
+  int32_t auto_runing_level = 0;
 };
 namespace opencl {
 enum class GpuType;
