@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <map>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -235,6 +237,13 @@ OpenCLExecutionProvider::OpenCLExecutionProvider(const OpenCLExecutionProviderIn
 OpenCLExecutionProvider::~OpenCLExecutionProvider() {
   // FIXME: kernel manager should release all managed kernels and programs
 
+  for (auto& kv : meta_cache_) {
+    if (kv.second.buf) clReleaseMemObject(kv.second.buf);
+  }
+  for (auto& kv : scratch_size_) {
+    if (kv.first) clReleaseMemObject(kv.first);
+  }
+
 #ifdef TRACY_ENABLE
   TracyCLCollect(tracy_cl_ctx_);
   TracyCLDestroy(tracy_cl_ctx_);
@@ -363,7 +372,7 @@ Status OpenCLExecutionProvider::InitOpenCLContext() {
 #ifdef TRACY_ENABLE
   cmd_queue_ = clCreateCommandQueue(ctx_, dev_, CL_QUEUE_PROFILING_ENABLE, &err);
 #else
-  cmd_queue_ = clCreateCommandQueue(ctx_, dev_, /*properties=*/0, &err);
+  cmd_queue_ = clCreateCommandQueue(ctx_, dev_, CL_QUEUE_PROFILING_ENABLE, &err);  // TEMP: profiling on
 #endif
   ORT_RETURN_IF_CL_ERROR(err);
 
@@ -439,6 +448,62 @@ Status OpenCLExecutionProvider::Sync() const {
   return Status::OK();
 }
 
+void OpenCLExecutionProvider::ProfRecord(const char* name, cl_event ev, uint64_t host_ns) const {
+  std::lock_guard<std::mutex> g(prof_mu_);
+  prof_entries_.push_back({name, host_ns, ev});
+}
+
+void OpenCLExecutionProvider::ProfDump() const {
+  std::vector<ProfEntry> entries;
+  {
+    std::lock_guard<std::mutex> g(prof_mu_);
+    if (prof_entries_.empty()) return;
+    entries.swap(prof_entries_);
+  }
+  clFinish(cmd_queue_);
+
+  struct Agg { uint64_t count = 0, host = 0, gpu = 0; };
+  std::map<std::string, Agg> agg;
+  for (auto& e : entries) {
+    uint64_t gpu = 0;
+    cl_ulong s = 0, t = 0;
+    if (e.ev &&
+        clGetEventProfilingInfo(e.ev, CL_PROFILING_COMMAND_START, sizeof(s), &s, nullptr) == CL_SUCCESS &&
+        clGetEventProfilingInfo(e.ev, CL_PROFILING_COMMAND_END, sizeof(t), &t, nullptr) == CL_SUCCESS) {
+      gpu = static_cast<uint64_t>(t - s);
+    }
+    auto& a = agg[e.name];
+    a.count++;
+    a.host += e.host_ns;
+    a.gpu += gpu;
+    if (e.ev) clReleaseEvent(e.ev);
+  }
+
+  std::vector<std::pair<std::string, Agg>> v(agg.begin(), agg.end());
+  std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.gpu > b.second.gpu; });
+  uint64_t th = 0, tg = 0, tn = 0;
+  LOGS_DEFAULT(ERROR) << "[CLPROF] ===== " << entries.size() << " kernels =====";
+  for (auto& kv : v) {
+    LOGS_DEFAULT(ERROR) << "[CLPROF] " << kv.first << " n=" << kv.second.count
+                        << " gpu_us=" << (kv.second.gpu / 1000) << " host_us=" << (kv.second.host / 1000);
+    th += kv.second.host;
+    tg += kv.second.gpu;
+    tn += kv.second.count;
+  }
+  LOGS_DEFAULT(ERROR) << "[CLPROF] TOTAL n=" << tn << " gpu_us=" << (tg / 1000)
+                      << " host_us=" << (th / 1000);
+  uint64_t h[6], hn[6];
+  {
+    std::lock_guard<std::mutex> g(prof_mu_);
+    for (int i = 0; i < 6; ++i) { h[i] = prof_host_ns_[i]; hn[i] = prof_host_n_[i]; prof_host_ns_[i] = 0; prof_host_n_[i] = 0; }
+  }
+  LOGS_DEFAULT(ERROR) << "[CLPROF] HOST write=" << (h[0] / 1000) << "us(x" << hn[0] << ")"
+                      << " alloc=" << (h[1] / 1000) << "us(x" << hn[1] << ")"
+                      << " free=" << (h[2] / 1000) << "us(x" << hn[2] << ")"
+                      << " d2h=" << (h[3] / 1000) << "us(x" << hn[3] << ")"
+                      << " h2d=" << (h[4] / 1000) << "us(x" << hn[4] << ")";
+}
+
 
 #ifdef TRACY_ENABLE
 constexpr const char* kFrameMarkName = "OpenCL EP Run";
@@ -472,12 +537,79 @@ cl_mem OpenCLExecutionProvider::GetScratchBufferTmp(size_t nbytes) const {
       std::cerr << "GetScratchBuffer bufferSizes is null." << std::endl;
       return NULL;
   }
+  {
+    std::lock_guard<std::mutex> g(aux_mu_);
+    auto it = scratch_pool_.find(nbytes);
+    if (it != scratch_pool_.end() && !it->second.empty()) {
+      cl_mem buf = it->second.back();
+      it->second.pop_back();
+      return buf;
+    }
+  }
   int err = 0;
+  const auto _t0 = std::chrono::steady_clock::now();
   auto ptr = clCreateBuffer(this->GetOpenCLContext(), CL_MEM_READ_WRITE, nbytes, NULL, &err);
+  ProfHostAdd(1, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now() - _t0).count()));
   ORT_THROW_IF_CL_ERROR(err);
   VLOGF_DEFAULT(V_ALLOC, "Allocated Buffer(%p){size=%zu}", ptr, nbytes);
+  {
+    std::lock_guard<std::mutex> g(aux_mu_);
+    scratch_size_[ptr] = nbytes;
+  }
 
   return ptr;
+}
+
+void OpenCLExecutionProvider::ReleaseCLBuffer(cl_mem buffer) {
+  if (buffer == NULL) return;
+  {
+    std::lock_guard<std::mutex> g(aux_mu_);
+    auto it = scratch_size_.find(buffer);
+    if (it != scratch_size_.end()) {
+      scratch_pool_[it->second].push_back(buffer);  // reuse later, don't free
+      return;
+    }
+  }
+  const auto _t0 = std::chrono::steady_clock::now();
+  cl_int err = clReleaseMemObject(buffer);
+  ProfHostAdd(2, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now() - _t0).count()));
+  if (err != CL_SUCCESS) printf("Error releasing buffer: %d\n", err);
+}
+
+cl_mem OpenCLExecutionProvider::GetOrUploadMetadata(uint64_t key, const void* data, size_t nbytes) {
+  if (data == nullptr || nbytes == 0) return nullptr;
+  const uint8_t* d = static_cast<const uint8_t*>(data);
+  std::lock_guard<std::mutex> g(aux_mu_);
+  MetaEntry& e = meta_cache_[key];
+  if (e.buf != nullptr && e.bytes.size() == nbytes && memcmp(e.bytes.data(), d, nbytes) == 0) {
+    return e.buf;  // unchanged: no upload at all
+  }
+  if (e.buf == nullptr || e.cap < nbytes) {
+    if (e.buf != nullptr) clReleaseMemObject(e.buf);
+    int err = 0;
+    e.buf = clCreateBuffer(this->GetOpenCLContext(), CL_MEM_READ_WRITE, nbytes, NULL, &err);
+    ORT_THROW_IF_CL_ERROR(err);
+    e.cap = nbytes;
+  }
+  const auto _t0 = std::chrono::steady_clock::now();
+  cl_int err = clEnqueueWriteBuffer(this->GetCommandQueue(), e.buf, CL_TRUE, 0, nbytes, d, 0, nullptr, nullptr);
+  ProfHostAdd(0, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now() - _t0).count()));
+  if (err != CL_SUCCESS) {
+    std::cerr << "Error in GetOrUploadMetadata clEnqueueWriteBuffer: " << err << std::endl;
+    return nullptr;
+  }
+  e.bytes.assign(d, d + nbytes);
+  return e.buf;
+}
+
+void OpenCLExecutionProvider::ProfHostAdd(int cat, uint64_t ns) const {
+  if (cat < 0 || cat > 5) return;
+  std::lock_guard<std::mutex> g(prof_mu_);
+  prof_host_ns_[cat] += ns;
+  prof_host_n_[cat] += 1;
 }
 void OpenCLExecutionProvider::ReadFromCLBuffer(cl_mem buffer,void* host_ptr,size_t nbytes){
       cl_int err;
@@ -506,6 +638,7 @@ void OpenCLExecutionProvider::WriteToCLBuffer(cl_mem buffer, const void* host_pt
         std::cerr << "WriteToCLBuffer:Host pointer is null." << std::endl;
         return;
     }
+    const auto _t0 = std::chrono::steady_clock::now();
     // Enqueue the command to write to the buffer
     err = clEnqueueWriteBuffer(this->GetCommandQueue(), buffer, CL_TRUE, 0, nbytes, host_ptr, 0, nullptr, nullptr);
     if (err != CL_SUCCESS) {
@@ -514,6 +647,8 @@ void OpenCLExecutionProvider::WriteToCLBuffer(cl_mem buffer, const void* host_pt
     }
     // Wait for the command to complete
     err = clFinish(this->GetCommandQueue());
+    ProfHostAdd(0, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::steady_clock::now() - _t0).count()));
     if (err != CL_SUCCESS) {
         std::cerr << "Error in clFinish: " << err << std::endl;
         return;

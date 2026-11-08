@@ -67,7 +67,9 @@ Status CreateProgramWithSource(cl_context ctx, cl_device_id dev, std::string_vie
 
   // Specially handle this error, we need compiler error message here.
   {
+    LOGS_DEFAULT(ERROR) << "[CL] clBuildProgram start (" << size << " bytes, opts='" << options << "')";
     err = clBuildProgram(*program, 1, &dev, options.c_str(), nullptr, nullptr);
+    LOGS_DEFAULT(ERROR) << "[CL] clBuildProgram done err=" << static_cast<int>(err);
   }
   if (err != CL_SUCCESS) {
     size_t ret_size;

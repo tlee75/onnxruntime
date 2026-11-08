@@ -9,6 +9,9 @@
 #include "core/providers/cpu/tensor/utils.h"
 
 #include <cstring>
+#include <cstdint>
+#include <limits>
+#include <vector>
 
 #include "core/framework/ortdevice.h"
 namespace onnxruntime {
@@ -114,40 +117,42 @@ Status Slice<dynamic>::Compute(OpKernelContext* ctx) const {
   TensorShapeVector output_strides;
   ComputeSliceStrides(input_shape, input_strides, output_strides, compute_metadata);
 
-  auto Input_strides = exec_->GetScratchBufferTmp(input_strides.size() * sizeof(int64_t));
-  auto Output_strides = exec_->GetScratchBufferTmp(output_strides.size() * sizeof(int64_t));
-  exec_->WriteToCLBuffer(Input_strides, input_strides.data(), input_strides.size() * sizeof(int64_t));
-  exec_->WriteToCLBuffer(Output_strides, output_strides.data(), output_strides.size() * sizeof(int64_t));
+  // The kernel does 32-bit index math (see slice.cl), so pass int32 metadata.
+  // `int` fits every per-dim size/stride the EP accepts (see the guard below).
+  ORT_ENFORCE(input_tensor->SizeInBytes() <= std::numeric_limits<int>::max(),
+              "Slice: tensor too large for the OpenCL EP's 32-bit indexing");
+  auto to_int = [](const TensorShapeVector& v) {
+    std::vector<int> out(v.size());
+    for (size_t i = 0; i < v.size(); ++i) out[i] = static_cast<int>(v[i]);
+    return out;
+  };
+  const std::vector<int> in_strides = to_int(input_strides);
+  const std::vector<int> out_strides = to_int(output_strides);
+  const std::vector<int> starts = to_int(compute_metadata.starts_);
+  const std::vector<int> steps = to_int(compute_metadata.steps_);
 
-  auto Input_shape = exec_->GetScratchBufferTmp(input_shape.NumDimensions() * sizeof(int64_t));
-  auto Output_shape = exec_->GetScratchBufferTmp(output_shape.NumDimensions() * sizeof(int64_t));
-
-  exec_->WriteToCLBuffer(Input_shape, input_shape.GetDims().data(), input_shape.NumDimensions() * sizeof(int64_t));
-  exec_->WriteToCLBuffer(Output_shape, output_shape.GetDims().data(), output_shape.NumDimensions() * sizeof(int64_t));
-  cl_mem input_starts_mem;
-  cl_mem input_steps_mem;
-  input_starts_mem = exec_->GetScratchBufferTmp(compute_metadata.starts_.size() * sizeof(int64_t));
-  exec_->WriteToCLBuffer(input_starts_mem, compute_metadata.starts_.data(), compute_metadata.starts_.size() * sizeof(int64_t));
-  input_steps_mem = exec_->GetScratchBufferTmp(compute_metadata.steps_.size() * sizeof(int64_t));
-  exec_->WriteToCLBuffer(input_steps_mem, compute_metadata.steps_.data(), compute_metadata.steps_.size() * sizeof(int64_t));
+  // Stride/start/step metadata is constant for a fixed graph; upload it once
+  // (cached) so it never inserts a blocking write into the pipeline. Keyed by
+  // this op instance, so the cache stays bounded.
+  const uint64_t base = reinterpret_cast<uint64_t>(this) * 8;
+  cl_mem Input_strides = exec_->GetOrUploadMetadata(base + 0, in_strides.data(), in_strides.size() * sizeof(int));
+  cl_mem Output_strides = exec_->GetOrUploadMetadata(base + 1, out_strides.data(), out_strides.size() * sizeof(int));
+  cl_mem input_starts_mem = exec_->GetOrUploadMetadata(base + 2, starts.data(), starts.size() * sizeof(int));
+  cl_mem input_steps_mem = exec_->GetOrUploadMetadata(base + 3, steps.data(), steps.size() * sizeof(int));
 
   ORT_RETURN_IF_ERROR(
       KernelLauncher{GetKernel("Slice")}
           .SetBuffers(*input_tensor, *output_tensor)
-          .SetArg<cl_long>((cl_long)input_dimensions.size())
-          .SetArg<cl_long>((cl_long)input_tensor->DataType()->Size())
+          .SetArg<cl_int>((cl_int)input_dimensions.size())
+          .SetArg<cl_int>((cl_int)input_tensor->DataType()->Size())
           .SetBuffers(input_starts_mem, input_steps_mem)
           .SetBuffers(Input_strides, Output_strides)
-          .SetArg<cl_long>((cl_long)compute_metadata.output_dims_.size())
-          .SetArg<cl_long>((cl_long)input_tensor->SizeInBytes())
+          .SetArg<cl_int>((cl_int)compute_metadata.output_dims_.size())
+          .SetArg<cl_int>((cl_int)input_tensor->SizeInBytes())
           .Launch(*exec_, {output_tensor->SizeInBytes() / input_tensor->DataType()->Size(), 1, 1}));
 
-  exec_->ReleaseCLBuffer(Input_shape);
-  exec_->ReleaseCLBuffer(Output_shape);
-  exec_->ReleaseCLBuffer(Input_strides);
-  exec_->ReleaseCLBuffer(Output_strides);
-  exec_->ReleaseCLBuffer(input_starts_mem);
-  exec_->ReleaseCLBuffer(input_steps_mem);
+  // The stride/start/step buffers are owned by the EP metadata cache
+  // (GetOrUploadMetadata), so they are not released here.
   exec_->Sync();
   return Status::OK();
 }

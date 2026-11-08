@@ -3,6 +3,12 @@
 
 #pragma once
 
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 #include "opencl_utils.h"
 #include "opencl_forward_decl.h"
 
@@ -96,22 +102,31 @@ class OpenCLExecutionProvider : public IExecutionProvider {
     return cfg != 0;
   }
 
+  /// True when the device advertises cl_khr_fp16 (so the *_F16 kernels exist).
+  bool SupportsFp16() const { return dev_info_.has_fp16; }
+
+  /// CL_DEVICE_MAX_WORK_ITEM_SIZES[dim] — the per-dimension cap on the GLOBAL
+  /// work size. A kernel whose grid exceeds it must grid-stride: Mali tolerates
+  /// huge per-dimension sizes, but Adreno (smaller cap) can reject or schedule
+  /// them pathologically.
+  size_t MaxWorkItemSize(int dim) const { return dev_info_.max_work_item_size[dim]; }
+
   // /// Get an OpenCL Buffer for temporary usage from Buffer allocator.
   cl_mem GetScratchBufferTmp(size_t nbytes) const;
   void WriteToCLBuffer(cl_mem buffer, const void* host_ptr, size_t nbytes);
   void ReadFromCLBuffer(cl_mem buffer,void* host_ptr,size_t nbytes);
 
-  void ReleaseCLBuffer(cl_mem buffer) {
-      if (buffer == NULL) {
-          return;
-      }
+  /// Return a device buffer holding `data`, uploading it only when the bytes for
+  /// `key` change. Shape/stride metadata is constant across runs for a fixed
+  /// graph, so this avoids the per-op blocking write (a full in-order-queue
+  /// drain) on every run. `key` should identify the op instance + slot, keeping
+  /// the cache bounded.
+  cl_mem GetOrUploadMetadata(uint64_t key, const void* data, size_t nbytes);
 
-      cl_int err;
-      err = clReleaseMemObject(buffer);
-      if (err != CL_SUCCESS) {
-          printf("Error releasing buffer: %d\n", err);
-      }
-  }
+  void ReleaseCLBuffer(cl_mem buffer);
+
+  // TEMP diagnostics: accumulate host-side time by category (see ProfHostAdd).
+  void ProfHostAdd(int cat, uint64_t ns) const;
 
   // /// Get an OpenCL Buffer for temporary usage from Image2D allocator.
   // IAllocatorUniquePtrToClMem GetScratchImage2D(const opencl::Image2DDesc& desc) const;
@@ -127,6 +142,12 @@ class OpenCLExecutionProvider : public IExecutionProvider {
   /// OpenCL after kernel launch performance heuristic. This is called in
   /// KernelLauncher
   Status AfterCLLaunch() const;
+
+  // TEMP diagnostics: record a launched kernel with its profiling event and the
+  // host time the enqueue took. ProfDump() clFinishes, prints a per-kernel
+  // host/GPU breakdown, and resets.
+  void ProfRecord(const char* name, cl_event ev, uint64_t host_ns) const;
+  void ProfDump() const;
 
   const std::string GetCompileOptions() const { return compile_options_; };
 
@@ -150,6 +171,35 @@ class OpenCLExecutionProvider : public IExecutionProvider {
   bool flush_after_launch_;
   std::string compile_options_;
   opencl::OpenCLDeviceInfo dev_info_;
+
+  // TEMP diagnostics
+  struct ProfEntry {
+    std::string name;
+    uint64_t host_ns;
+    cl_event ev;
+  };
+  mutable std::mutex prof_mu_;
+  mutable std::vector<ProfEntry> prof_entries_;
+  // TEMP diagnostics: host-side time by category
+  // 0=WriteToCLBuffer 1=GetScratchBufferTmp 2=ReleaseCLBuffer
+  // 3=d2h read 4=h2d write
+  mutable uint64_t prof_host_ns_[6] = {0, 0, 0, 0, 0, 0};
+  mutable uint64_t prof_host_n_[6] = {0, 0, 0, 0, 0, 0};
+
+  // Metadata upload cache (see GetOrUploadMetadata): key -> device buffer +
+  // the bytes last uploaded, so an unchanged upload is skipped.
+  struct MetaEntry {
+    cl_mem buf = nullptr;
+    size_t cap = 0;
+    std::vector<uint8_t> bytes;
+  };
+  mutable std::mutex aux_mu_;
+  mutable std::unordered_map<uint64_t, MetaEntry> meta_cache_;
+
+  // Scratch-buffer reuse: size -> free buffers, and buffer -> size, so a freed
+  // scratch buffer is handed back out instead of churning the allocator.
+  mutable std::unordered_map<cl_mem, size_t> scratch_size_;
+  mutable std::unordered_map<size_t, std::vector<cl_mem>> scratch_pool_;
 
  private:
   std::unique_ptr<opencl::OpenCLProgramManager> program_manager_;

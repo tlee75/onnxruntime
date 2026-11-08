@@ -81,7 +81,9 @@ __kernel void ConvTranspose_TransposeWeight(
   WtT[mk * C + c] = Wt[c * (M * K) + mk];
 }
 
-// col2im gather: gws = (Wout, M).
+// col2im gather: gws = (min(Wout, device cap), M); the `ow` axis grid-strides so
+// the global work size never exceeds CL_DEVICE_MAX_WORK_ITEM_SIZES[0] (Adreno
+// rejects/schedules huge per-dimension sizes badly; Mali tolerates them).
 __kernel void ConvTranspose_Col2im(
     const int M,
     const int K,
@@ -94,16 +96,19 @@ __kernel void ConvTranspose_Col2im(
     __global const float* P,
     __global const float* B,
     __global float* Y) {
-  const int ow = get_global_id(0);
   const int m = get_global_id(1);
-  if (ow >= Wout || m >= M) return;
-  float acc = has_bias ? B[m] : 0.0f;
-  for (int k = 0; k < K; ++k) {
-    const int num = ow + pad - k * dil;
-    if (num >= 0 && (num % stride) == 0) {
-      const int iw = num / stride;
-      if (iw < W) acc += P[(m * K + k) * W + iw];
+  if (m >= M) return;
+  const int g0 = get_global_size(0);
+  const float bias = has_bias ? B[m] : 0.0f;
+  for (int ow = get_global_id(0); ow < Wout; ow += g0) {
+    float acc = bias;
+    for (int k = 0; k < K; ++k) {
+      const int num = ow + pad - k * dil;
+      if (num >= 0 && (num % stride) == 0) {
+        const int iw = num / stride;
+        if (iw < W) acc += P[(m * K + k) * W + iw];
+      }
     }
+    Y[m * Wout + ow] = acc;
   }
-  Y[m * Wout + ow] = acc;
 }
