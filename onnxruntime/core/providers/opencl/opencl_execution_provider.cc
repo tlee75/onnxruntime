@@ -235,6 +235,13 @@ OpenCLExecutionProvider::OpenCLExecutionProvider(const OpenCLExecutionProviderIn
 OpenCLExecutionProvider::~OpenCLExecutionProvider() {
   // FIXME: kernel manager should release all managed kernels and programs
 
+  for (auto& kv : meta_cache_) {
+    if (kv.second.buf) clReleaseMemObject(kv.second.buf);
+  }
+  for (auto& kv : scratch_size_) {
+    if (kv.first) clReleaseMemObject(kv.first);
+  }
+
 #ifdef TRACY_ENABLE
   TracyCLCollect(tracy_cl_ctx_);
   TracyCLDestroy(tracy_cl_ctx_);
@@ -439,7 +446,6 @@ Status OpenCLExecutionProvider::Sync() const {
   return Status::OK();
 }
 
-
 #ifdef TRACY_ENABLE
 constexpr const char* kFrameMarkName = "OpenCL EP Run";
 #endif
@@ -472,13 +478,65 @@ cl_mem OpenCLExecutionProvider::GetScratchBufferTmp(size_t nbytes) const {
       std::cerr << "GetScratchBuffer bufferSizes is null." << std::endl;
       return NULL;
   }
+  {
+    std::lock_guard<std::mutex> g(aux_mu_);
+    auto it = scratch_pool_.find(nbytes);
+    if (it != scratch_pool_.end() && !it->second.empty()) {
+      cl_mem buf = it->second.back();
+      it->second.pop_back();
+      return buf;
+    }
+  }
   int err = 0;
   auto ptr = clCreateBuffer(this->GetOpenCLContext(), CL_MEM_READ_WRITE, nbytes, NULL, &err);
   ORT_THROW_IF_CL_ERROR(err);
   VLOGF_DEFAULT(V_ALLOC, "Allocated Buffer(%p){size=%zu}", ptr, nbytes);
+  {
+    std::lock_guard<std::mutex> g(aux_mu_);
+    scratch_size_[ptr] = nbytes;
+  }
 
   return ptr;
 }
+
+void OpenCLExecutionProvider::ReleaseCLBuffer(cl_mem buffer) {
+  if (buffer == NULL) return;
+  {
+    std::lock_guard<std::mutex> g(aux_mu_);
+    auto it = scratch_size_.find(buffer);
+    if (it != scratch_size_.end()) {
+      scratch_pool_[it->second].push_back(buffer);  // reuse later, don't free
+      return;
+    }
+  }
+  cl_int err = clReleaseMemObject(buffer);
+  if (err != CL_SUCCESS) printf("Error releasing buffer: %d\n", err);
+}
+
+cl_mem OpenCLExecutionProvider::GetOrUploadMetadata(uint64_t key, const void* data, size_t nbytes) {
+  if (data == nullptr || nbytes == 0) return nullptr;
+  const uint8_t* d = static_cast<const uint8_t*>(data);
+  std::lock_guard<std::mutex> g(aux_mu_);
+  MetaEntry& e = meta_cache_[key];
+  if (e.buf != nullptr && e.bytes.size() == nbytes && memcmp(e.bytes.data(), d, nbytes) == 0) {
+    return e.buf;  // unchanged: no upload at all
+  }
+  if (e.buf == nullptr || e.cap < nbytes) {
+    if (e.buf != nullptr) clReleaseMemObject(e.buf);
+    int err = 0;
+    e.buf = clCreateBuffer(this->GetOpenCLContext(), CL_MEM_READ_WRITE, nbytes, NULL, &err);
+    ORT_THROW_IF_CL_ERROR(err);
+    e.cap = nbytes;
+  }
+  cl_int err = clEnqueueWriteBuffer(this->GetCommandQueue(), e.buf, CL_TRUE, 0, nbytes, d, 0, nullptr, nullptr);
+  if (err != CL_SUCCESS) {
+    std::cerr << "Error in GetOrUploadMetadata clEnqueueWriteBuffer: " << err << std::endl;
+    return nullptr;
+  }
+  e.bytes.assign(d, d + nbytes);
+  return e.buf;
+}
+
 void OpenCLExecutionProvider::ReadFromCLBuffer(cl_mem buffer,void* host_ptr,size_t nbytes){
       cl_int err;
     // Ensure host_ptr is not null

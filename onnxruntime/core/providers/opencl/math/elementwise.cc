@@ -74,17 +74,17 @@ TensorShape broadcast_shape(const TensorShape& shape1, const TensorShape& shape2
         ORT_RETURN_IF_ERROR(KernelLauncher{GetKernel(_kn)}.SetBuffers(*a, *b, *c).Launch(*exec_, {static_cast<size_t>(out_shape.Size()), 1, 1}));\
         return Status::OK();\
       }  \
-      const size_t Shape_sIze = 5 * sizeof(int);             \
-      auto A_Shape = exec_->GetScratchBufferTmp(Shape_sIze);  \
-      auto B_Shape = exec_->GetScratchBufferTmp(Shape_sIze);  \
-      auto C_Shape = exec_->GetScratchBufferTmp(Shape_sIze);  \
+      const size_t Shape_sIze = 5 * sizeof(int);                                                                                              \
+      cl_mem A_Shape = nullptr;                                                            \
+      cl_mem B_Shape = nullptr;                                                            \
+      cl_mem C_Shape = nullptr;                                                            \
       int a_shape[5], b_shape[5], c_shape[5];                                                                       \
       FillShape5(a->Shape(), a_shape); \
       FillShape5(b->Shape(), b_shape); \
       FillShape5(c->Shape(), c_shape); \
-      exec_->WriteToCLBuffer(A_Shape, a_shape, Shape_sIze);  \
-      exec_->WriteToCLBuffer(B_Shape, b_shape, Shape_sIze);  \
-      exec_->WriteToCLBuffer(C_Shape, c_shape, Shape_sIze);  \
+      A_Shape = exec_->GetOrUploadMetadata(reinterpret_cast<uint64_t>(this) * 8 + 0, a_shape, Shape_sIze);                                                             \
+      B_Shape = exec_->GetOrUploadMetadata(reinterpret_cast<uint64_t>(this) * 8 + 1, b_shape, Shape_sIze);                                                             \
+      C_Shape = exec_->GetOrUploadMetadata(reinterpret_cast<uint64_t>(this) * 8 + 2, c_shape, Shape_sIze);                                                             \
                                                                                                                         \
       ORT_RETURN_IF_ERROR(                                                                                              \
           KernelLauncher{GetKernel(#CLASS_NAME)}                                                                        \
@@ -95,9 +95,9 @@ TensorShape broadcast_shape(const TensorShape& shape1, const TensorShape& shape2
               .SetArg<cl_int>((c->Shape().GetDims().data() == nullptr) ? 1 : c->Shape().NumDimensions())                \
               .Launch(*exec_, {c->SizeInBytes() / c->DataType()->Size(), 1, 1}));                                       \
                                                                                                                         \
-      exec_->ReleaseCLBuffer(A_Shape);                       \
-      exec_->ReleaseCLBuffer(B_Shape);                       \
-      exec_->ReleaseCLBuffer(C_Shape);                       \
+      /* A_Shape is owned by the EP metadata cache */                                                                                  \
+      /* B_Shape is owned by the EP metadata cache */                                                                                  \
+      /* C_Shape is owned by the EP metadata cache */                                                                                  \
       return Status::OK();                                                                                              \
     }                                                                                                                   \
   };
@@ -173,17 +173,17 @@ ONNX_OPERATOR_VERSIONED_KERNEL_EX(
         ORT_RETURN_IF_ERROR(KernelLauncher{GetKernel(_kn)}.SetBuffers(*a, *b, *c).Launch(*exec_, {static_cast<size_t>(out_shape.Size()), 1, 1}));\
         return Status::OK();\
       }  \
-      const size_t Shape_sIze = 5 * sizeof(int);             \
-      auto A_Shape = exec_->GetScratchBufferTmp(Shape_sIze);  \
-      auto B_Shape = exec_->GetScratchBufferTmp(Shape_sIze);  \
-      auto C_Shape = exec_->GetScratchBufferTmp(Shape_sIze);  \
+      const size_t Shape_sIze = 5 * sizeof(int);                                                                                              \
+      cl_mem A_Shape = nullptr;                                                            \
+      cl_mem B_Shape = nullptr;                                                            \
+      cl_mem C_Shape = nullptr;                                                            \
       int a_shape[5], b_shape[5], c_shape[5];                                                                       \
       FillShape5(a->Shape(), a_shape); \
       FillShape5(b->Shape(), b_shape); \
       FillShape5(c->Shape(), c_shape); \
-      exec_->WriteToCLBuffer(A_Shape, a_shape, Shape_sIze);  \
-      exec_->WriteToCLBuffer(B_Shape, b_shape, Shape_sIze);  \
-      exec_->WriteToCLBuffer(C_Shape, c_shape, Shape_sIze);  \
+      A_Shape = exec_->GetOrUploadMetadata(reinterpret_cast<uint64_t>(this) * 8 + 0, a_shape, Shape_sIze);                                                             \
+      B_Shape = exec_->GetOrUploadMetadata(reinterpret_cast<uint64_t>(this) * 8 + 1, b_shape, Shape_sIze);                                                             \
+      C_Shape = exec_->GetOrUploadMetadata(reinterpret_cast<uint64_t>(this) * 8 + 2, c_shape, Shape_sIze);                                                             \
                                                                                                                         \
       ORT_RETURN_IF_ERROR(                                                                                              \
           KernelLauncher{GetKernel(#CLASS_NAME)}                                                                        \
@@ -194,9 +194,9 @@ ONNX_OPERATOR_VERSIONED_KERNEL_EX(
               .SetArg<cl_int>((c->Shape().GetDims().data() == nullptr) ? 1 : c->Shape().NumDimensions())                \
               .Launch(*exec_, {c->SizeInBytes() / c->DataType()->Size(), 1, 1}));                                       \
                                                                                                                         \
-      exec_->ReleaseCLBuffer(A_Shape);                       \
-      exec_->ReleaseCLBuffer(B_Shape);                       \
-      exec_->ReleaseCLBuffer(C_Shape);                       \
+      /* A_Shape is owned by the EP metadata cache */                                                                                  \
+      /* B_Shape is owned by the EP metadata cache */                                                                                  \
+      /* C_Shape is owned by the EP metadata cache */                                                                                  \
       return Status::OK();                                                                                              \
     }                                                                                                                   \
   };
