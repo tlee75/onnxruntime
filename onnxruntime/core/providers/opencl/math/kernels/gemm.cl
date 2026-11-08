@@ -74,9 +74,11 @@ void Gemm_Tiled(
     const int M,
     const int N,
     const int K,
+    const int has_bias,
     __global const float* A,
     __global const float* B,
-    __global float* C) {
+    __global float* C,
+    __global const float* Bias) {
   const int lx = get_local_id(0);  // N dimension
   const int ly = get_local_id(1);  // M dimension
   const int tid = ly * get_local_size(0) + lx;
@@ -86,6 +88,13 @@ void Gemm_Tiled(
   __local float Bs[GEMM_BK][GEMM_BN];
 
   const int row0 = get_group_id(1) * GEMM_BM;
+  // Bias seeds the accumulator (added once per output element); owners that
+  // apply it elsewhere (ConvTranspose's col2im) pass has_bias = 0.
+  float bias_r[GEMM_TM];
+  for (int i = 0; i < GEMM_TM; ++i) {
+    const int gr = row0 + ly * GEMM_TM + i;
+    bias_r[i] = (has_bias && gr < M) ? Bias[gr] : 0.0f;
+  }
   const int numNtiles = (N + GEMM_BN - 1) / GEMM_BN;
 
   for (int nt = get_group_id(0); nt < numNtiles; nt += get_num_groups(0)) {
@@ -94,7 +103,7 @@ void Gemm_Tiled(
     float acc[GEMM_TM][GEMM_TN];
     for (int i = 0; i < GEMM_TM; ++i)
       for (int j = 0; j < GEMM_TN; ++j)
-        acc[i][j] = 0.0f;
+        acc[i][j] = bias_r[i];
 
     for (int k0 = 0; k0 < K; k0 += GEMM_BK) {
       for (int idx = tid; idx < GEMM_BM * GEMM_BK; idx += nthreads) {
@@ -148,9 +157,11 @@ void Gemm_Tiled_F16(
     const int M,
     const int N,
     const int K,
+    const int has_bias,
     __global const float* A,
     __global const float* B,
-    __global float* C) {
+    __global float* C,
+    __global const float* Bias) {
   const int lx = get_local_id(0);
   const int ly = get_local_id(1);
   const int tid = ly * get_local_size(0) + lx;
@@ -160,6 +171,11 @@ void Gemm_Tiled_F16(
   __local half Bs[GEMM_BK][GEMM_BN];
 
   const int row0 = get_group_id(1) * GEMM_BM;
+  half bias_r[GEMM_TM];
+  for (int i = 0; i < GEMM_TM; ++i) {
+    const int gr = row0 + ly * GEMM_TM + i;
+    bias_r[i] = (half)((has_bias && gr < M) ? Bias[gr] : 0.0f);
+  }
   const int numNtiles = (N + GEMM_BN - 1) / GEMM_BN;
 
   for (int nt = get_group_id(0); nt < numNtiles; nt += get_num_groups(0)) {
@@ -168,7 +184,7 @@ void Gemm_Tiled_F16(
     half2 acc2[GEMM_TM][GEMM_TN / 2];
     for (int i = 0; i < GEMM_TM; ++i)
       for (int j2 = 0; j2 < GEMM_TN / 2; ++j2)
-        acc2[i][j2] = (half2)(0.0f, 0.0f);
+        acc2[i][j2] = (half2)(bias_r[i], bias_r[i]);
 
     for (int k0 = 0; k0 < K; k0 += GEMM_BK) {
       for (int idx = tid; idx < GEMM_BM * GEMM_BK; idx += nthreads) {
