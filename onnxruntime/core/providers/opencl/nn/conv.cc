@@ -52,7 +52,13 @@ class Conv : public OpenCLKernel {
     LoadKernel("Gemm_Tiled_Conv_BM32");
     LoadKernel("Gemm_Tiled_Conv_BM16");
     LoadKernel("Gemm_Tiled_Conv_BN32");
-    if (exec_->SupportsFp16()) LoadKernel("Gemm_Tiled_F16");
+    if (exec_->SupportsFp16()) {
+      LoadKernel("Gemm_Tiled_F16");
+      LoadKernel("Gemm_Tiled_Conv_F16");
+      LoadKernel("Gemm_Tiled_Conv_BM32_F16");
+      LoadKernel("Gemm_Tiled_Conv_BM16_F16");
+      LoadKernel("Gemm_Tiled_Conv_BN32_F16");
+    }
   }
 
   // The GEMM kernel to use: the fp16 variant when the device supports it AND the
@@ -126,9 +132,14 @@ class Conv : public OpenCLKernel {
         // N-tiles => more work-groups). The local size MUST match the variant.
         const size_t bm = (m_i <= 16) ? 16u : (m_i <= 32 ? 32u : 64u);
         const size_t bn = (bm == 64 && wout_i <= 128) ? 32u : 64u;
-        const char* kn = (bm == 16) ? "Gemm_Tiled_Conv_BM16"
-                                    : (bm == 32 ? "Gemm_Tiled_Conv_BM32"
-                                                : (bn == 32 ? "Gemm_Tiled_Conv_BN32" : "Gemm_Tiled_Conv"));
+        // Pick the fp16 twin when the device supports fp16 and the session
+        // asked for it; the fp16 kernels use half the local memory (better
+        // occupancy) and half2 MAC.
+        const bool f16 = exec_->SupportsFp16() && exec_->UseFp16();
+        const char* kn = (bm == 16) ? (f16 ? "Gemm_Tiled_Conv_BM16_F16" : "Gemm_Tiled_Conv_BM16")
+                                    : (bm == 32 ? (f16 ? "Gemm_Tiled_Conv_BM32_F16" : "Gemm_Tiled_Conv_BM32")
+                                                : (bn == 32 ? (f16 ? "Gemm_Tiled_Conv_BN32_F16" : "Gemm_Tiled_Conv_BN32")
+                                                            : (f16 ? "Gemm_Tiled_Conv_F16" : "Gemm_Tiled_Conv")));
         const size_t flx = bn / kGemmTN;
         const size_t fly = bm / kGemmTM;
         const size_t fgm = (static_cast<size_t>(m_i) + bm - 1) / bm;
