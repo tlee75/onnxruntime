@@ -29,6 +29,7 @@ class Slice : public OpenCLKernel, public SliceBase {
       : OpenCLKernel(info), SliceBase(info, dynamic) {
     LoadProgram(slice_kernel_src, slice_kernel_src_len);
     LoadKernel("Slice");
+    LoadKernel("Slice_I64");
   };
 
   Status Compute(OpKernelContext* ctx) const override;
@@ -117,10 +118,15 @@ Status Slice<dynamic>::Compute(OpKernelContext* ctx) const {
   TensorShapeVector output_strides;
   ComputeSliceStrides(input_shape, input_strides, output_strides, compute_metadata);
 
-  // The kernel does 32-bit index math (see slice.cl), so pass int32 metadata.
-  // `int` fits every per-dim size/stride the EP accepts (see the guard below).
-  ORT_ENFORCE(input_tensor->SizeInBytes() <= std::numeric_limits<int>::max(),
-              "Slice: tensor too large for the OpenCL EP's 32-bit indexing");
+  // The per-dim metadata (starts/steps/strides) is int32, so each dimension
+  // must fit int -- nothing practical does not. The *flattened* size may exceed
+  // int: the kernel has a 64-bit twin for that, so it is no longer an error.
+  for (auto d : input_shape.GetDims()) {
+    ORT_ENFORCE(d <= static_cast<int64_t>(std::numeric_limits<int>::max()),
+                "Slice: a Slice dimension exceeds the OpenCL EP's 32-bit metadata");
+  }
+  const bool wide = input_tensor->SizeInBytes() > static_cast<int64_t>(std::numeric_limits<int>::max());
+  const char* kn = wide ? "Slice_I64" : "Slice";
   auto to_int = [](const TensorShapeVector& v) {
     std::vector<int> out(v.size());
     for (size_t i = 0; i < v.size(); ++i) out[i] = static_cast<int>(v[i]);
@@ -141,14 +147,14 @@ Status Slice<dynamic>::Compute(OpKernelContext* ctx) const {
   cl_mem input_steps_mem = exec_->GetOrUploadMetadata(base + 3, steps.data(), steps.size() * sizeof(int));
 
   ORT_RETURN_IF_ERROR(
-      KernelLauncher{GetKernel("Slice")}
+      KernelLauncher{GetKernel(kn)}
           .SetBuffers(*input_tensor, *output_tensor)
           .SetArg<cl_int>((cl_int)input_dimensions.size())
           .SetArg<cl_int>((cl_int)input_tensor->DataType()->Size())
           .SetBuffers(input_starts_mem, input_steps_mem)
           .SetBuffers(Input_strides, Output_strides)
           .SetArg<cl_int>((cl_int)compute_metadata.output_dims_.size())
-          .SetArg<cl_int>((cl_int)input_tensor->SizeInBytes())
+          .SetArg<cl_long>((cl_long)input_tensor->SizeInBytes())
           .Launch(*exec_, {output_tensor->SizeInBytes() / input_tensor->DataType()->Size(), 1, 1}));
 
   // The stride/start/step buffers are owned by the EP metadata cache
