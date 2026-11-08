@@ -153,7 +153,12 @@ Status Slice<dynamic>::Compute(OpKernelContext* ctx) const {
 
   // The stride/start/step buffers are owned by the EP metadata cache
   // (GetOrUploadMetadata), so they are not released here.
-  exec_->Sync();
+  //
+  // No Sync() here: the EP enqueues asynchronously and drain only at the end
+  // of the run (and on any device->host copy). A clFinish after every Slice
+  // flushes the in-order queue mid-graph — the GPU goes idle and every later
+  // kernel pays a fresh dispatch bubble — which is exactly what the cached
+  // metadata upload above was added to avoid.
   return Status::OK();
 }
 
