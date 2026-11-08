@@ -62,24 +62,11 @@ __kernel void ConvTranspose1D_Float(
 }
 
 // Fast path (group==1, one batch):
-//   1. transpose the weight [C, M, K] -> WtT [M*K, C]
-//   2. P[M*K, W] = WtT[M*K, C] @ X[C, W]                 (Gemm_Tiled)
-//   3. Y[m, ow] = B[m] + sum_k P[m*K + k, (ow + pad - k*dil)/stride]
+//   1. P[M*K, W] = Wt[C, M*K]^T @ X[C, W]  (Gemm_Tiled with trans_a = 1, so the
+//      weight is read in its natural [C, M*K] layout -- no transpose kernel)
+//   2. Y[m, ow] = B[m] + sum_k P[m*K + k, (ow + pad - k*dil)/stride]
 //      (only the k with (ow+pad-k*dil) divisible by stride and in range).
 // The col2im step is a gather (no atomics), so overlapping taps are handled.
-//
-// gws = (C, M*K): the writes to WtT are coalesced.
-__kernel void ConvTranspose_TransposeWeight(
-    const int C,
-    const int M,
-    const int K,
-    __global const float* Wt,
-    __global float* WtT) {
-  const int c = get_global_id(0);
-  const int mk = get_global_id(1);  // m*K + k
-  if (c >= C || mk >= M * K) return;
-  WtT[mk * C + c] = Wt[c * (M * K) + mk];
-}
 
 // col2im gather: gws = (min(Wout, device cap), M); the `ow` axis grid-strides so
 // the global work size never exceeds CL_DEVICE_MAX_WORK_ITEM_SIZES[0] (Adreno
