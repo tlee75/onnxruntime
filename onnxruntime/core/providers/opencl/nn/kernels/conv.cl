@@ -184,3 +184,85 @@ DEFINE_GEMM_TILED_CONV(Gemm_Tiled_Conv_BM16, 16, 64, 32, 4, 4)
 // Narrower BN (=> 2x the N-tiles, i.e. more work-groups) for the short-and-
 // narrow conv GEMMs (small Wout), where BN=64 leaves the grid under-filled.
 DEFINE_GEMM_TILED_CONV(Gemm_Tiled_Conv_BN32, 64, 32, 32, 4, 4)
+
+#if defined(cl_khr_fp16)
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+
+// fp16 twin of DEFINE_GEMM_TILED_CONV: half local tiles (=> half the local
+// footprint, so more work-groups fit — the reason fp16 Gemm_Tiled is far
+// faster than its fp32 form on Adreno) and half2 MAC/accumulate. The global
+// tensors stay fp32; only the tiles are narrowed. Selected by the host when the
+// device advertises fp16 AND the session asked for it (addOpenCL(useFp16,..)).
+#define DEFINE_GEMM_TILED_CONV_F16(NAME, BM, BN, BK, TM, TN)                     \
+  __kernel __attribute__((reqd_work_group_size(BN / TN, BM / TM, 1)))           \
+  void NAME(const int M, const int Wout, const int C, const int W,              \
+            const int K, const int stride, const int pad, const int dil,        \
+            __global const float* Wt, __global const float* X,                   \
+            __global float* Y) {                                                \
+    const int lx = get_local_id(0);                                             \
+    const int ly = get_local_id(1);                                             \
+    const int tid = ly * get_local_size(0) + lx;                                \
+    const int nthreads = get_local_size(0) * get_local_size(1);                 \
+    __local half As[BM][BK];                                                    \
+    __local half Bs[BK][BN];                                                    \
+    const int row0 = get_group_id(1) * BM;                                      \
+    const int Kdim = C * K;                                                     \
+    const int numNtiles = (Wout + BN - 1) / BN;                                 \
+    for (int nt = get_group_id(0); nt < numNtiles; nt += get_num_groups(0)) {   \
+      const int col0 = nt * BN;                                                 \
+      half2 acc2[TM][TN / 2];                                                    \
+      for (int i = 0; i < TM; ++i)                                              \
+        for (int j2 = 0; j2 < TN / 2; ++j2) acc2[i][j2] = (half2)(0.0f, 0.0f);  \
+      for (int k0 = 0; k0 < Kdim; k0 += BK) {                                   \
+        for (int idx = tid; idx < BM * BK; idx += nthreads) {                   \
+          const int i = idx / BK;                                               \
+          const int kk = idx % BK;                                              \
+          const int gr = row0 + i;                                              \
+          const int gk = k0 + kk;                                               \
+          As[i][kk] = (half)((gr < M && gk < Kdim) ? Wt[gr * Kdim + gk] : 0.0f);\
+        }                                                                       \
+        for (int idx = tid; idx < BK * BN; idx += nthreads) {                   \
+          const int kk = idx / BN;                                              \
+          const int j = idx % BN;                                               \
+          const int gk = k0 + kk;                                               \
+          const int ow = col0 + j;                                              \
+          float v = 0.0f;                                                       \
+          if (gk < Kdim && ow < Wout) {                                         \
+            const int c = gk / K;                                               \
+            const int tap = gk - c * K;                                         \
+            const int iw = ow * stride - pad + tap * dil;                       \
+            if (iw >= 0 && iw < W) v = X[c * W + iw];                           \
+          }                                                                     \
+          Bs[kk][j] = (half)v;                                                  \
+        }                                                                       \
+        barrier(CLK_LOCAL_MEM_FENCE);                                           \
+        for (int kk = 0; kk < BK; ++kk) {                                       \
+          half a[TM];                                                           \
+          for (int i = 0; i < TM; ++i) a[i] = As[ly * TM + i][kk];              \
+          for (int j2 = 0; j2 < TN / 2; ++j2) {                                 \
+            const int jc = lx * TN + 2 * j2;                                    \
+            const half2 b2 = (half2)(Bs[kk][jc], Bs[kk][jc + 1]);               \
+            for (int i = 0; i < TM; ++i)                                        \
+              acc2[i][j2] = (half2)(a[i], a[i]) * b2 + acc2[i][j2];             \
+          }                                                                     \
+        }                                                                       \
+        barrier(CLK_LOCAL_MEM_FENCE);                                           \
+      }                                                                         \
+      for (int i = 0; i < TM; ++i) {                                            \
+        const int gr = row0 + ly * TM + i;                                      \
+        if (gr >= M) continue;                                                  \
+        for (int j2 = 0; j2 < TN / 2; ++j2) {                                   \
+          const int gc = col0 + lx * TN + 2 * j2;                               \
+          if (gc < Wout) Y[gr * Wout + gc] = (float)acc2[i][j2].lo;             \
+          if (gc + 1 < Wout) Y[gr * Wout + gc + 1] = (float)acc2[i][j2].hi;     \
+        }                                                                       \
+      }                                                                         \
+      barrier(CLK_LOCAL_MEM_FENCE);                                             \
+    }                                                                           \
+  }
+
+DEFINE_GEMM_TILED_CONV_F16(Gemm_Tiled_Conv_F16, 64, 64, 32, 4, 4)
+DEFINE_GEMM_TILED_CONV_F16(Gemm_Tiled_Conv_BM32_F16, 32, 64, 32, 4, 4)
+DEFINE_GEMM_TILED_CONV_F16(Gemm_Tiled_Conv_BM16_F16, 16, 64, 32, 4, 4)
+DEFINE_GEMM_TILED_CONV_F16(Gemm_Tiled_Conv_BN32_F16, 64, 32, 32, 4, 4)
+#endif
