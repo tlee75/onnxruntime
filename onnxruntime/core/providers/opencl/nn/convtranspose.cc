@@ -3,6 +3,7 @@
 
 #include "convtranspose.h"
 
+#include <algorithm>
 #include <vector>
 
 #include "core/providers/opencl/opencl_kernel.h"
@@ -47,6 +48,13 @@ class ConvTranspose : public OpenCLKernel {
     LoadKernel("ConvTranspose_TransposeWeight");
     LoadKernel("ConvTranspose_Col2im");
     LoadKernel("Gemm_Tiled");
+    if (exec_->SupportsFp16()) LoadKernel("Gemm_Tiled_F16");
+  }
+
+  // See Conv::GemmKernel: fp16 only when the device supports it AND the session
+  // asked for fp16.
+  const char* GemmKernel() const {
+    return (exec_->SupportsFp16() && exec_->UseFp16()) ? "Gemm_Tiled_F16" : "Gemm_Tiled";
   }
 
   Status Compute(OpKernelContext* context) const override {
@@ -84,6 +92,7 @@ class ConvTranspose : public OpenCLKernel {
       const int m_i = static_cast<int>(M);
       const int wout_i = static_cast<int>(Wout);
       const int mk = m_i * k_i;  // rows of WtT / P
+      const size_t cap0 = exec_->MaxWorkItemSize(0);  // per-dim global size cap
 
       cl_mem wt = CL_BUFFER_FROM_TENSOR(*Wt);
       cl_mem x = CL_BUFFER_FROM_TENSOR(*X);
@@ -107,15 +116,16 @@ class ConvTranspose : public OpenCLKernel {
       const size_t ly = kGemmBM / kGemmTM;
       const size_t gn = (static_cast<size_t>(w_i) + kGemmBN - 1) / kGemmBN;
       const size_t gm = (static_cast<size_t>(mk) + kGemmBM - 1) / kGemmBM;
+      const size_t gn_used = std::min(gn, std::max<size_t>(1, cap0 / lx));
       ORT_RETURN_IF_ERROR(
-          KernelLauncher{GetKernel("Gemm_Tiled")}
+          KernelLauncher{GetKernel(GemmKernel())}
               .SetArg<cl_int>(mk)
               .SetArg<cl_int>(w_i)
               .SetArg<cl_int>(c_i)
               .SetBuffer(wtt)
               .SetBuffer(x)
               .SetBuffer(p)
-              .Launch(*exec_, NDRange(gn * lx, gm * ly), NDRange(lx, ly)));
+              .Launch(*exec_, NDRange(gn_used * lx, gm * ly), NDRange(lx, ly)));
 
       // Y[m, ow] = B[m] + sum_k P[m*K + k, (ow + pad - k*dil)/stride]
       ORT_RETURN_IF_ERROR(
@@ -131,7 +141,8 @@ class ConvTranspose : public OpenCLKernel {
               .SetBuffer(p)
               .SetBuffer(bias)
               .SetBuffer(y)
-              .Launch(*exec_, NDRange(static_cast<size_t>(wout_i), static_cast<size_t>(m_i))));
+              .Launch(*exec_, NDRange(std::min<size_t>(static_cast<size_t>(wout_i), cap0),
+                                      static_cast<size_t>(m_i))));
 
       exec_->ReleaseCLBuffer(wtt);
       exec_->ReleaseCLBuffer(p);
