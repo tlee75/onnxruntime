@@ -4,6 +4,7 @@
 #include "convtranspose.h"
 
 #include <algorithm>
+#include <limits>
 #include <vector>
 
 #include "core/providers/opencl/opencl_kernel.h"
@@ -85,6 +86,11 @@ class ConvTranspose : public OpenCLKernel {
     const int has_bias = (B != nullptr) ? 1 : 0;
 
     if (group_ == 1 && N == 1) {
+      // The conv kernels index in 32-bit; a dimension is never remotely near int,
+      // but fail loudly rather than silently truncate through the casts below.
+      const int64_t imax = std::numeric_limits<int>::max();
+      ORT_ENFORCE(C <= imax && W <= imax && K <= imax && M <= imax && Wout <= imax,
+                  "ConvTranspose: a dimension exceeds the OpenCL EP's 32-bit indexing");
       const int c_i = static_cast<int>(C);
       const int w_i = static_cast<int>(W);
       const int k_i = static_cast<int>(K);
