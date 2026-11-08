@@ -45,7 +45,6 @@ class ConvTranspose : public OpenCLKernel {
     if (dilations_.empty()) dilations_ = {1};
     LoadProgram(convtranspose_kernel_src, convtranspose_kernel_src_len);
     LoadKernel("ConvTranspose1D_Float");
-    LoadKernel("ConvTranspose_TransposeWeight");
     LoadKernel("ConvTranspose_Col2im");
     LoadKernel("Gemm_Tiled");
     if (exec_->SupportsFp16()) LoadKernel("Gemm_Tiled_F16");
@@ -98,20 +97,12 @@ class ConvTranspose : public OpenCLKernel {
       cl_mem x = CL_BUFFER_FROM_TENSOR(*X);
       cl_mem y = CL_BUFFER_FROM_TENSOR(*Y);
 
-      cl_mem wtt = exec_->GetScratchBufferTmp(static_cast<size_t>(mk) * c_i * sizeof(float));
       cl_mem p = exec_->GetScratchBufferTmp(static_cast<size_t>(mk) * w_i * sizeof(float));
 
-      // WtT[M*K, C] = transpose of Wt[C, M*K]
-      ORT_RETURN_IF_ERROR(
-          KernelLauncher{GetKernel("ConvTranspose_TransposeWeight")}
-              .SetArg<cl_int>(c_i)
-              .SetArg<cl_int>(m_i)
-              .SetArg<cl_int>(k_i)
-              .SetBuffer(wt)
-              .SetBuffer(wtt)
-              .Launch(*exec_, NDRange(static_cast<size_t>(c_i), static_cast<size_t>(mk))));
-
-      // P[M*K, W] = WtT[M*K, C] @ X[C, W]
+      // P[M*K, W] = Wt[C, M*K]^T @ X[C, W]. The GEMM reads the weight straight
+      // from its [C, M*K] layout (trans_a=1) instead of materializing a
+      // transposed copy first -- the transpose was a whole extra kernel plus a
+      // M*K*C read+write every run, for a matrix that never changes.
       const size_t lx = kGemmBN / kGemmTN;
       const size_t ly = kGemmBM / kGemmTM;
       const size_t gn = (static_cast<size_t>(w_i) + kGemmBN - 1) / kGemmBN;
@@ -123,7 +114,8 @@ class ConvTranspose : public OpenCLKernel {
               .SetArg<cl_int>(w_i)
               .SetArg<cl_int>(c_i)
               .SetArg<cl_int>(0)  // bias applied by Col2im below
-              .SetBuffer(wtt)
+              .SetArg<cl_int>(1)  // trans_a: A is the [C, M*K] weight
+              .SetBuffer(wt)
               .SetBuffer(x)
               .SetBuffer(p)
               .SetBuffer(bias)
@@ -146,7 +138,6 @@ class ConvTranspose : public OpenCLKernel {
               .Launch(*exec_, NDRange(std::min<size_t>(static_cast<size_t>(wout_i), cap0),
                                       static_cast<size_t>(m_i))));
 
-      exec_->ReleaseCLBuffer(wtt);
       exec_->ReleaseCLBuffer(p);
       return Status::OK();
     }

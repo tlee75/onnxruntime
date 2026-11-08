@@ -75,6 +75,7 @@ void Gemm_Tiled(
     const int N,
     const int K,
     const int has_bias,
+    const int trans_a,
     __global const float* A,
     __global const float* B,
     __global float* C,
@@ -107,11 +108,16 @@ void Gemm_Tiled(
 
     for (int k0 = 0; k0 < K; k0 += GEMM_BK) {
       for (int idx = tid; idx < GEMM_BM * GEMM_BK; idx += nthreads) {
-        const int i = idx / GEMM_BK;
-        const int kk = idx % GEMM_BK;
+        // trans_a: A is [K, M] (a ConvTranspose weight), read as A[gk*M + gr]
+        // instead of A[gr*K + gk]. Either way the tile is stored transposed, so
+        // mapping consecutive threads to consecutive `i` keeps the global read
+        // coalesced in both layouts -- which is what lets ConvTranspose skip its
+        // per-run weight-transpose kernel.
+        const int i = trans_a ? (idx % GEMM_BM) : (idx / GEMM_BK);
+        const int kk = trans_a ? (idx / GEMM_BM) : (idx % GEMM_BK);
         const int gr = row0 + i;
         const int gk = k0 + kk;
-        As[kk][i] = (gr < M && gk < K) ? A[gr * K + gk] : 0.0f;
+        As[kk][i] = (gr < M && gk < K) ? A[trans_a ? (gk * M + gr) : (gr * K + gk)] : 0.0f;
       }
       for (int idx = tid; idx < GEMM_BK * GEMM_BN; idx += nthreads) {
         const int kk = idx / GEMM_BN;
@@ -158,6 +164,7 @@ void Gemm_Tiled_F16(
     const int N,
     const int K,
     const int has_bias,
+    const int trans_a,
     __global const float* A,
     __global const float* B,
     __global float* C,
@@ -167,7 +174,10 @@ void Gemm_Tiled_F16(
   const int tid = ly * get_local_size(0) + lx;
   const int nthreads = get_local_size(0) * get_local_size(1);
 
-  __local half As[GEMM_BM][GEMM_BK];
+  // +2 (one 4-byte bank) so that filling As[i][kk] with consecutive threads on
+  // consecutive `i` (the trans_a / ConvTranspose layout) does not land every
+  // thread in the same local-memory bank.
+  __local half As[GEMM_BM][GEMM_BK + 2];
   __local half Bs[GEMM_BK][GEMM_BN];
 
   const int row0 = get_group_id(1) * GEMM_BM;
@@ -188,11 +198,11 @@ void Gemm_Tiled_F16(
 
     for (int k0 = 0; k0 < K; k0 += GEMM_BK) {
       for (int idx = tid; idx < GEMM_BM * GEMM_BK; idx += nthreads) {
-        const int i = idx / GEMM_BK;
-        const int kk = idx % GEMM_BK;
+        const int i = trans_a ? (idx % GEMM_BM) : (idx / GEMM_BK);
+        const int kk = trans_a ? (idx / GEMM_BM) : (idx % GEMM_BK);
         const int gr = row0 + i;
         const int gk = k0 + kk;
-        As[i][kk] = (half)((gr < M && gk < K) ? A[gr * K + gk] : 0.0f);
+        As[i][kk] = (half)((gr < M && gk < K) ? A[trans_a ? (gk * M + gr) : (gr * K + gk)] : 0.0f);
       }
       for (int idx = tid; idx < GEMM_BK * GEMM_BN; idx += nthreads) {
         const int kk = idx / GEMM_BN;
