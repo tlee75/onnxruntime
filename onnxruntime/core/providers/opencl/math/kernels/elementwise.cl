@@ -11,9 +11,9 @@
       __global type* A,                                                   \
       __global type* B,                                                   \
       __global type* C,                                                   \
-      __global long* Ashapes,                                             \
-      __global long* Bshapes,                                             \
-      __global long* Cshapes,                                             \
+      __global int* Ashapes,                                              \
+      __global int* Bshapes,                                              \
+      __global int* Cshapes,                                              \
       int Adims,                                                          \
       int Bdims,                                                          \
       int Cdims) {                                                        \
@@ -21,10 +21,13 @@
     int indices[5] = {0, 0, 0, 0, 0};                                     \
     int div = global_id;                                                  \
                                                                           \
-    /* Calculate the index for each dimension in C (output tensor) */     \
+    /* Calculate the index for each dimension in C (output tensor). */    \
+    /* The shape values are element counts and fit int32. Doing this       */ \
+    /* div/mod in 64-bit is ~10x slower on Adreno's OpenCL compiler.       */ \
     for (int i = Cdims - 1; i >= 0; --i) {                                \
-      indices[i] = div % Cshapes[i];                                      \
-      div /= Cshapes[i];                                                  \
+      int c_dim = Cshapes[i];                                             \
+      indices[i] = div % c_dim;                                           \
+      div /= c_dim;                                                       \
     }                                                                     \
                                                                           \
     /* Map the broadcasted indices to A and B */                          \
@@ -104,9 +107,9 @@ DEFINE_OP_KERNEL(half, fp16, pow, POW_OP)
       __global type* A,                                                   \
       __global type* B,                                                   \
       __global uchar* C,                                                  \
-      __global long* Ashapes,                                             \
-      __global long* Bshapes,                                             \
-      __global long* Cshapes,                                             \
+      __global int* Ashapes,                                              \
+      __global int* Bshapes,                                              \
+      __global int* Cshapes,                                              \
       int Adims,                                                          \
       int Bdims,                                                          \
       int Cdims) {                                                        \
@@ -114,10 +117,13 @@ DEFINE_OP_KERNEL(half, fp16, pow, POW_OP)
     int indices[5] = {0, 0, 0, 0, 0};                                     \
     int div = global_id;                                                  \
                                                                           \
-    /* Calculate the index for each dimension in C (output tensor) */     \
+    /* Calculate the index for each dimension in C (output tensor). */    \
+    /* The shape values are element counts and fit int32. Doing this       */ \
+    /* div/mod in 64-bit is ~10x slower on Adreno's OpenCL compiler.       */ \
     for (int i = Cdims - 1; i >= 0; --i) {                                \
-      indices[i] = div % Cshapes[i];                                      \
-      div /= Cshapes[i];                                                  \
+      int c_dim = Cshapes[i];                                             \
+      indices[i] = div % c_dim;                                           \
+      div /= c_dim;                                                       \
     }                                                                     \
                                                                           \
     /* Map the broadcasted indices to A and B */                          \

@@ -4,6 +4,8 @@
 #include "elementwise.h"
 
 #include <sstream>
+#include <cstdint>
+#include <limits>
 
 #include "core/providers/opencl/opencl_kernel.h"
 #include "core/providers/opencl/opencl_utils.h"
@@ -17,6 +19,18 @@ namespace {
 
 namespace onnxruntime {
 namespace opencl {
+
+// Elementwise shapes are passed to the kernel as int32 (see elementwise.cl):
+// the per-dim element counts fit int for any tensor the OpenCL EP accepts, and
+// 32-bit index math avoids the 64-bit integer division that is pathologically
+// slow on some mobile GPUs (e.g. Adreno). Dims beyond the tensor's rank stay 1.
+static void FillShape5(const TensorShape& shape, int* out) {
+  out[0] = out[1] = out[2] = out[3] = out[4] = 1;
+  const auto& dims = shape.GetDims();
+  const size_t n = dims.size() < 5 ? dims.size() : 5;
+  for (size_t i = 0; i < n; ++i) out[i] = static_cast<int>(dims[i]);
+}
+
 TensorShape broadcast_shape(const TensorShape& shape1, const TensorShape& shape2) {
   size_t dims1 = shape1.NumDimensions();
   size_t dims2 = shape2.NumDimensions();
@@ -41,7 +55,7 @@ TensorShape broadcast_shape(const TensorShape& shape1, const TensorShape& shape2
    public:                                                                                                              \
     explicit CLASS_NAME(const OpKernelInfo& info) : OpenCLKernel(info) {                                                \
       LoadProgram(elementwise_kernel_src, elementwise_kernel_src_len);                                                  \
-      LoadKernel(#CLASS_NAME);                                                                                          \
+      LoadKernel(#CLASS_NAME);\
     };                                                                                                                  \
                                                                                                                         \
     Status Compute(OpKernelContext* context) const override {                                                           \
@@ -50,17 +64,19 @@ TensorShape broadcast_shape(const TensorShape& shape1, const TensorShape& shape2
       auto* b = context->Input<Tensor>(1);                                                                              \
       TensorShape out_shape = broadcast_shape(a->Shape(), b->Shape());                                                  \
       auto* c = context->Output(0, out_shape);                                                                          \
-      int Shape_sIze = 40;                                                                                              \
-      auto A_Shape = exec_->GetScratchBufferTmp(Shape_sIze);                                                            \
-      auto B_Shape = exec_->GetScratchBufferTmp(Shape_sIze);                                                            \
-      auto C_Shape = exec_->GetScratchBufferTmp(Shape_sIze);                                                            \
-      int64_t constant_shape[] = {1, 1, 1, 1, 1};                                                                       \
-      const int64_t* a_Shape = (a->Shape().GetDims().data() == nullptr) ? constant_shape : a->Shape().GetDims().data(); \
-      const int64_t* b_Shape = (b->Shape().GetDims().data() == nullptr) ? constant_shape : b->Shape().GetDims().data(); \
-      const int64_t* c_Shape = (c->Shape().GetDims().data() == nullptr) ? constant_shape : c->Shape().GetDims().data(); \
-      exec_->WriteToCLBuffer(A_Shape, a_Shape, Shape_sIze);                                                             \
-      exec_->WriteToCLBuffer(B_Shape, b_Shape, Shape_sIze);                                                             \
-      exec_->WriteToCLBuffer(C_Shape, c_Shape, Shape_sIze);                                                             \
+      ORT_ENFORCE(c->Shape().Size() <= static_cast<int64_t>(std::numeric_limits<int>::max()),                             \
+                  "Elementwise: tensor too large for the OpenCL EP's 32-bit indexing");\
+      const size_t Shape_sIze = 5 * sizeof(int);             \
+      auto A_Shape = exec_->GetScratchBufferTmp(Shape_sIze);  \
+      auto B_Shape = exec_->GetScratchBufferTmp(Shape_sIze);  \
+      auto C_Shape = exec_->GetScratchBufferTmp(Shape_sIze);  \
+      int a_shape[5], b_shape[5], c_shape[5];                                                                       \
+      FillShape5(a->Shape(), a_shape); \
+      FillShape5(b->Shape(), b_shape); \
+      FillShape5(c->Shape(), c_shape); \
+      exec_->WriteToCLBuffer(A_Shape, a_shape, Shape_sIze);  \
+      exec_->WriteToCLBuffer(B_Shape, b_shape, Shape_sIze);  \
+      exec_->WriteToCLBuffer(C_Shape, c_shape, Shape_sIze);  \
                                                                                                                         \
       ORT_RETURN_IF_ERROR(                                                                                              \
           KernelLauncher{GetKernel(#CLASS_NAME)}                                                                        \
@@ -71,9 +87,9 @@ TensorShape broadcast_shape(const TensorShape& shape1, const TensorShape& shape2
               .SetArg<cl_int>((c->Shape().GetDims().data() == nullptr) ? 1 : c->Shape().NumDimensions())                \
               .Launch(*exec_, {c->SizeInBytes() / c->DataType()->Size(), 1, 1}));                                       \
                                                                                                                         \
-      exec_->ReleaseCLBuffer(A_Shape);                                                                                  \
-      exec_->ReleaseCLBuffer(B_Shape);                                                                                  \
-      exec_->ReleaseCLBuffer(C_Shape);                                                                                  \
+      exec_->ReleaseCLBuffer(A_Shape);                       \
+      exec_->ReleaseCLBuffer(B_Shape);                       \
+      exec_->ReleaseCLBuffer(C_Shape);                       \
       return Status::OK();                                                                                              \
     }                                                                                                                   \
   };
@@ -130,7 +146,7 @@ ONNX_OPERATOR_VERSIONED_KERNEL_EX(
    public:                                                                                                              \
     explicit CLASS_NAME(const OpKernelInfo& info) : OpenCLKernel(info) {                                                \
       LoadProgram(elementwise_kernel_src, elementwise_kernel_src_len);                                                  \
-      LoadKernel(#CLASS_NAME);                                                                                          \
+      LoadKernel(#CLASS_NAME);\
     };                                                                                                                  \
                                                                                                                         \
     Status Compute(OpKernelContext* context) const override {                                                           \
@@ -139,17 +155,19 @@ ONNX_OPERATOR_VERSIONED_KERNEL_EX(
       auto* b = context->Input<Tensor>(1);                                                                              \
       TensorShape out_shape = broadcast_shape(a->Shape(), b->Shape());                                                  \
       auto* c = context->Output(0, out_shape);                                                                          \
-      int Shape_sIze = 40;                                                                                              \
-      auto A_Shape = exec_->GetScratchBufferTmp(Shape_sIze);                                                            \
-      auto B_Shape = exec_->GetScratchBufferTmp(Shape_sIze);                                                            \
-      auto C_Shape = exec_->GetScratchBufferTmp(Shape_sIze);                                                            \
-      int64_t constant_shape[] = {1, 1, 1, 1, 1};                                                                       \
-      const int64_t* a_Shape = (a->Shape().GetDims().data() == nullptr) ? constant_shape : a->Shape().GetDims().data(); \
-      const int64_t* b_Shape = (b->Shape().GetDims().data() == nullptr) ? constant_shape : b->Shape().GetDims().data(); \
-      const int64_t* c_Shape = (c->Shape().GetDims().data() == nullptr) ? constant_shape : c->Shape().GetDims().data(); \
-      exec_->WriteToCLBuffer(A_Shape, a_Shape, Shape_sIze);                                                             \
-      exec_->WriteToCLBuffer(B_Shape, b_Shape, Shape_sIze);                                                             \
-      exec_->WriteToCLBuffer(C_Shape, c_Shape, Shape_sIze);                                                             \
+      ORT_ENFORCE(c->Shape().Size() <= static_cast<int64_t>(std::numeric_limits<int>::max()),                             \
+                  "Elementwise: tensor too large for the OpenCL EP's 32-bit indexing");\
+      const size_t Shape_sIze = 5 * sizeof(int);             \
+      auto A_Shape = exec_->GetScratchBufferTmp(Shape_sIze);  \
+      auto B_Shape = exec_->GetScratchBufferTmp(Shape_sIze);  \
+      auto C_Shape = exec_->GetScratchBufferTmp(Shape_sIze);  \
+      int a_shape[5], b_shape[5], c_shape[5];                                                                       \
+      FillShape5(a->Shape(), a_shape); \
+      FillShape5(b->Shape(), b_shape); \
+      FillShape5(c->Shape(), c_shape); \
+      exec_->WriteToCLBuffer(A_Shape, a_shape, Shape_sIze);  \
+      exec_->WriteToCLBuffer(B_Shape, b_shape, Shape_sIze);  \
+      exec_->WriteToCLBuffer(C_Shape, c_shape, Shape_sIze);  \
                                                                                                                         \
       ORT_RETURN_IF_ERROR(                                                                                              \
           KernelLauncher{GetKernel(#CLASS_NAME)}                                                                        \
@@ -160,9 +178,9 @@ ONNX_OPERATOR_VERSIONED_KERNEL_EX(
               .SetArg<cl_int>((c->Shape().GetDims().data() == nullptr) ? 1 : c->Shape().NumDimensions())                \
               .Launch(*exec_, {c->SizeInBytes() / c->DataType()->Size(), 1, 1}));                                       \
                                                                                                                         \
-      exec_->ReleaseCLBuffer(A_Shape);                                                                                  \
-      exec_->ReleaseCLBuffer(B_Shape);                                                                                  \
-      exec_->ReleaseCLBuffer(C_Shape);                                                                                  \
+      exec_->ReleaseCLBuffer(A_Shape);                       \
+      exec_->ReleaseCLBuffer(B_Shape);                       \
+      exec_->ReleaseCLBuffer(C_Shape);                       \
       return Status::OK();                                                                                              \
     }                                                                                                                   \
   };

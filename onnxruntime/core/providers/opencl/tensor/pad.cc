@@ -3,6 +3,7 @@
 
 #include "pad.h"
 
+#include <cstdint>
 #include <vector>
 
 #include "core/providers/opencl/opencl_kernel.h"
@@ -35,26 +36,25 @@ class Pad : public OpenCLKernel {
     const int64_t* pads = pads_t->Data<int64_t>();
     const float constant_value = (cv_t != nullptr) ? cv_t->Data<float>()[0] : 0.0f;
 
-    int64_t in_shape[5] = {1, 1, 1, 1, 1};
-    int64_t out_shape[5] = {1, 1, 1, 1, 1};
-    int64_t begin[5] = {0, 0, 0, 0, 0};
+    int in_shape[5] = {1, 1, 1, 1, 1};
+    int out_shape[5] = {1, 1, 1, 1, 1};
+    int begin[5] = {0, 0, 0, 0, 0};
     std::vector<int64_t> out_dims(rank);
     for (int i = 0; i < rank; ++i) {
-      in_shape[i] = xs[i];
-      begin[i] = pads[i];
-      out_shape[i] = xs[i] + pads[i] + pads[i + rank];
+      in_shape[i] = static_cast<int>(xs[i]);
+      begin[i] = static_cast<int>(pads[i]);
+      out_shape[i] = static_cast<int>(xs[i] + pads[i] + pads[i + rank]);
       out_dims[i] = out_shape[i];
     }
     Tensor* Y = context->Output(0, TensorShape(out_dims));
 
-    const size_t nbytes = 5 * sizeof(int64_t);
+    const size_t nbytes = 5 * sizeof(int);
     auto in_buf = exec_->GetScratchBufferTmp(nbytes);
     auto out_buf = exec_->GetScratchBufferTmp(nbytes);
     auto begin_buf = exec_->GetScratchBufferTmp(nbytes);
     exec_->WriteToCLBuffer(in_buf, in_shape, nbytes);
     exec_->WriteToCLBuffer(out_buf, out_shape, nbytes);
     exec_->WriteToCLBuffer(begin_buf, begin, nbytes);
-
     ORT_RETURN_IF_ERROR(
         KernelLauncher{GetKernel("Pad_Float")}
             .SetBuffers(*X, *Y)
