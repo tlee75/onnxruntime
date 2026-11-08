@@ -230,17 +230,16 @@ class Conv : public OpenCLKernel {
                           cl_mem a, cl_mem x, cl_mem y, cl_mem bias,
                           int c_i, int w_i, int k_i, int stride, int pad_l, int dilation,
                           int has_bias) const {
-    // Default: BM is the smallest tile that still covers M (so no accumulator row
-    // is padded away); BN halves to 32 when a full-width tile would leave the grid
-    // too thin to fill the device. Both were measured on Mali-G76 and Adreno 740.
+    // Default (no autotune): BM is the smallest tile that still covers M, so no
+    // accumulator row is padded away. BN is the full-width tile except when the
+    // conv is narrow in BOTH M and Wout, where halving BN doubles the number of
+    // N-tiles. That threshold is EMPIRICAL: Adreno and Mali are both sensitive to
+    // the work-group count at these sizes (a 512x128 conv goes from 16 to 32
+    // work-groups), and it was measured on Mali-G76 / Adreno 740.
+    // enableAutoTune re-measures per device instead of trusting it.
     const ConvTile fallback = (m_i <= 16) ? ConvTile{16, 64}
                                           : (m_i <= 32 ? ConvTile{32, 64}
                                                        : ConvTile{64, wout_i <= 128 ? 32u : 64u});
-    if (!exec_->TuneEnabledLevel()) {
-      return fallback;
-    }
-
-    static constexpr ConvTile kCandidates[] = {{64, 64}, {32, 64}, {16, 64}, {64, 32}};
     const std::array<int, 4> key{m_i, wout_i, c_i * k_i, f16 ? 1 : 0};
     {
       std::lock_guard<std::mutex> guard(tile_mu_);
@@ -249,6 +248,21 @@ class Conv : public OpenCLKernel {
         return ConvTile{it->second[0], it->second[1]};
       }
     }
+
+    if (!exec_->TuneEnabledLevel()) {
+      // Memoise + log once per shape, so a run records which tile each conv got.
+      LOGS_DEFAULT(WARNING) << "[CL] conv gemm tile bm=" << fallback.bm << " bn=" << fallback.bn
+                         << " M=" << m_i << " Wout=" << wout_i << " kdim=" << (c_i * k_i)
+                         << (f16 ? " fp16" : " fp32");
+      std::lock_guard<std::mutex> guard(tile_mu_);
+      tile_choice_[key] = {fallback.bm, fallback.bn};
+      return fallback;
+    }
+
+    static constexpr ConvTile kCandidates[] = {{64, 64}, {32, 64}, {16, 64}, {64, 32}};
+    LOGS_DEFAULT(WARNING) << "[CL] conv gemm tuning: default bm=" << fallback.bm << " bn="
+                       << fallback.bn << " M=" << m_i << " Wout=" << wout_i << " kdim="
+                       << (c_i * k_i) << (f16 ? " fp16" : " fp32");
 
     ConvTile best = fallback;
     double best_us = std::numeric_limits<double>::max();
@@ -266,6 +280,9 @@ class Conv : public OpenCLKernel {
         best = t;
       }
     }
+    LOGS_DEFAULT(WARNING) << "[CL] conv gemm tuned bm=" << best.bm << " bn=" << best.bn
+                       << " (default was bm=" << fallback.bm << " bn=" << fallback.bn
+                       << ") us=" << best_us << " M=" << m_i << " Wout=" << wout_i;
     {
       std::lock_guard<std::mutex> guard(tile_mu_);
       tile_choice_[key] = {best.bm, best.bn};
