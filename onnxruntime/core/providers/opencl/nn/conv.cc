@@ -51,6 +51,7 @@ class Conv : public OpenCLKernel {
     LoadKernel("Gemm_Tiled_Conv");
     LoadKernel("Gemm_Tiled_Conv_BM32");
     LoadKernel("Gemm_Tiled_Conv_BM16");
+    LoadKernel("Gemm_Tiled_Conv_BN32");
     if (exec_->SupportsFp16()) LoadKernel("Gemm_Tiled_F16");
   }
 
@@ -120,15 +121,18 @@ class Conv : public OpenCLKernel {
                 .Launch(*exec_, NDRange(gn_used * lx, gm * ly), NDRange(lx, ly)));
       } else {
         // General conv: fuse im2col into the GEMM. The conv GEMM is short and
-        // wide (tiny M, huge Wout), so pick a small-BM variant whose tile wastes
-        // fewer padded rows. The local size MUST match that variant's tile.
+        // wide, so pick a tile that fills the grid: a small BM when M is tiny
+        // (wastes fewer padded rows), a narrow BN when Wout is small (more
+        // N-tiles => more work-groups). The local size MUST match the variant.
         const size_t bm = (m_i <= 16) ? 16u : (m_i <= 32 ? 32u : 64u);
+        const size_t bn = (bm == 64 && wout_i <= 128) ? 32u : 64u;
         const char* kn = (bm == 16) ? "Gemm_Tiled_Conv_BM16"
-                                    : (bm == 32 ? "Gemm_Tiled_Conv_BM32" : "Gemm_Tiled_Conv");
-        const size_t flx = kGemmBN / kGemmTN;
+                                    : (bm == 32 ? "Gemm_Tiled_Conv_BM32"
+                                                : (bn == 32 ? "Gemm_Tiled_Conv_BN32" : "Gemm_Tiled_Conv"));
+        const size_t flx = bn / kGemmTN;
         const size_t fly = bm / kGemmTM;
         const size_t fgm = (static_cast<size_t>(m_i) + bm - 1) / bm;
-        const size_t fgn = (static_cast<size_t>(wout_i) + kGemmBN - 1) / kGemmBN;
+        const size_t fgn = (static_cast<size_t>(wout_i) + bn - 1) / bn;
         const size_t fgn_used = std::min(fgn, std::max<size_t>(1, cap0 / flx));
         ORT_RETURN_IF_ERROR(
             KernelLauncher{GetKernel(kn)}

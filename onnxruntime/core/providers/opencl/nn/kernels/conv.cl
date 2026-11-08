@@ -181,3 +181,6 @@ __kernel void Conv_AddBias(
 DEFINE_GEMM_TILED_CONV(Gemm_Tiled_Conv, 64, 64, 32, 4, 4)
 DEFINE_GEMM_TILED_CONV(Gemm_Tiled_Conv_BM32, 32, 64, 32, 4, 4)
 DEFINE_GEMM_TILED_CONV(Gemm_Tiled_Conv_BM16, 16, 64, 32, 4, 4)
+// Narrower BN (=> 2x the N-tiles, i.e. more work-groups) for the short-and-
+// narrow conv GEMMs (small Wout), where BN=64 leaves the grid under-filled.
+DEFINE_GEMM_TILED_CONV(Gemm_Tiled_Conv_BN32, 64, 32, 32, 4, 4)
