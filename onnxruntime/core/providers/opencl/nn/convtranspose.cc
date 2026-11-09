@@ -59,6 +59,7 @@ class ConvTranspose : public OpenCLKernel {
       LoadKernel("WinoCtGather");
       LoadKernel("WinoWeightT");
       LoadKernel("WinoInputT");
+      LoadKernel("WinoInputT6");
       LoadKernel("WinoOutputT");
     }
   }
@@ -280,19 +281,35 @@ class ConvTranspose : public OpenCLKernel {
         }
         ct_key_[r] = key;
       }
-      for (int t = 0; t < 6; ++t) {
+      if (exec_->Exp().find("winoin1") == std::string::npos) {
+        // All six transform points in ONE launch (the default; `winoin1` forces the
+        // old per-point form so the win stays measurable).
         ORT_RETURN_IF_ERROR(
-            KernelLauncher{GetKernel("WinoInputT")}
+            KernelLauncher{GetKernel("WinoInputT6")}
                 .SetBuffer(x)
                 .SetArg<cl_int>(c_i)
                 .SetArg<cl_int>(w_i)
                 .SetArg<cl_int>(1)  // NS
                 .SetArg<cl_int>(pad3)
                 .SetArg<cl_int>(T)
-                .SetArg<cl_int>(t)
                 .SetArg<cl_int>(static_cast<cl_int>(ct))
                 .SetBuffer(ct_v_[r])
                 .Launch(*exec_, NDRange(static_cast<size_t>(T), static_cast<size_t>(c_i))));
+      } else {
+        for (int t = 0; t < 6; ++t) {
+          ORT_RETURN_IF_ERROR(
+              KernelLauncher{GetKernel("WinoInputT")}
+                  .SetBuffer(x)
+                  .SetArg<cl_int>(c_i)
+                  .SetArg<cl_int>(w_i)
+                  .SetArg<cl_int>(1)  // NS
+                  .SetArg<cl_int>(pad3)
+                  .SetArg<cl_int>(T)
+                  .SetArg<cl_int>(t)
+                  .SetArg<cl_int>(static_cast<cl_int>(ct))
+                  .SetBuffer(ct_v_[r])
+                  .Launch(*exec_, NDRange(static_cast<size_t>(T), static_cast<size_t>(c_i))));
+        }
       }
       const size_t lx = 16;  // Gemm_Tiled_F16H work-group: GEMM_BN / GEMM_TN
       const size_t ly = 16;  //                             GEMM_BM / GEMM_TM

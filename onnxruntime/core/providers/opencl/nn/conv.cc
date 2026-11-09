@@ -76,6 +76,7 @@ class Conv : public OpenCLKernel {
       // DEV-ONLY (ORT_OPENCL_EXP=winograd): see WinogradConv().
       LoadKernel("WinoWeightT");
       LoadKernel("WinoInputT");
+      LoadKernel("WinoInputT6");
       LoadKernel("WinoOutputT");
     }
   }
@@ -494,19 +495,36 @@ class Conv : public OpenCLKernel {
                 .Launch(*exec_, NDRange(nc, static_cast<size_t>(m_i))));
       }
     }
-    for (int t = 0; t < 6; ++t) {
+    if (exec_->Exp().find("winoin1") == std::string::npos) {
+      // All six transform points in ONE launch (the default): each work-item reads
+      // its 6-tap window once and emits all six planes. `winoin1` forces the old
+      // per-point form (six launches, X re-read ~6x) so the win stays measurable.
       ORT_RETURN_IF_ERROR(
-          KernelLauncher{GetKernel("WinoInputT")}
+          KernelLauncher{GetKernel("WinoInputT6")}
               .SetBuffer(x)
               .SetArg<cl_int>(c_i)
               .SetArg<cl_int>(w_i)
               .SetArg<cl_int>(NS)
               .SetArg<cl_int>(pad_l)
               .SetArg<cl_int>(T)
-              .SetArg<cl_int>(t)
               .SetArg<cl_int>(static_cast<cl_int>(v_stride))
               .SetBuffer(wino_v_)
               .Launch(*exec_, NDRange(static_cast<size_t>(T), nc)));
+    } else {
+      for (int t = 0; t < 6; ++t) {
+        ORT_RETURN_IF_ERROR(
+            KernelLauncher{GetKernel("WinoInputT")}
+                .SetBuffer(x)
+                .SetArg<cl_int>(c_i)
+                .SetArg<cl_int>(w_i)
+                .SetArg<cl_int>(NS)
+                .SetArg<cl_int>(pad_l)
+                .SetArg<cl_int>(T)
+                .SetArg<cl_int>(t)
+                .SetArg<cl_int>(static_cast<cl_int>(v_stride))
+                .SetBuffer(wino_v_)
+                .Launch(*exec_, NDRange(static_cast<size_t>(T), nc)));
+      }
     }
     const size_t lx = 16;  // Gemm_Tiled_F16H work-group: GEMM_BN / GEMM_TN
     const size_t ly = 16;  //                             GEMM_BM / GEMM_TM

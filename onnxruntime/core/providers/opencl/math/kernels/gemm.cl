@@ -495,6 +495,36 @@ __kernel void WinoInputT(__global const half* X, const int C, const int W,
   V[t * v_stride + row * T + j] = (half)v;
 }
 
+// DEV-ONLY (ORT_OPENCL_EXP=...winoin6): the SAME input transform, but all six
+// transform points in ONE launch. The per-point version above is launched six
+// times and re-reads the whole 6-tap window (and recomputes d[]) each time, so X
+// is read ~6x more than the data warrants; here each work-item reads its window
+// once and emits all six planes. Reads drop ~6x; writes are unchanged.
+__kernel void WinoInputT6(__global const half* X, const int C, const int W,
+                          const int NS, const int pad, const int T,
+                          const int v_stride, __global half* V) {
+  const int j = get_global_id(0);
+  const int row = get_global_id(1);  // s*C + c
+  const int NC = NS * C;
+  if (j >= T || row >= NC) return;
+  const int s = row / C;
+  const int c = row - s * C;
+  const int base = 4 * j - pad + 3 * s;
+  float d[6];
+#pragma unroll
+  for (int r = 0; r < 6; ++r) {
+    const int iw = base + r;
+    d[r] = (iw >= 0 && iw < W) ? (float)X[c * W + iw] : 0.0f;
+  }
+  const int o = row * T + j;
+  V[0 * v_stride + o] = (half)(4.0f * d[0] - 5.0f * d[2] + d[4]);
+  V[1 * v_stride + o] = (half)(-4.0f * d[1] - 4.0f * d[2] + d[3] + d[4]);
+  V[2 * v_stride + o] = (half)(4.0f * d[1] - 4.0f * d[2] - d[3] + d[4]);
+  V[3 * v_stride + o] = (half)(-2.0f * d[1] - d[2] + 2.0f * d[3] + d[4]);
+  V[4 * v_stride + o] = (half)(2.0f * d[1] - d[2] - 2.0f * d[3] + d[4]);
+  V[5 * v_stride + o] = (half)(4.0f * d[1] - 5.0f * d[3] + d[5]);
+}
+
 // os/r place the tile in the output: os=1,r=0 for a plain Conv, and os=stride,
 // r=phase for a ConvTranspose phase (which writes every os-th element). P holds
 // the six transform planes back to back, p_stride apart.
