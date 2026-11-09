@@ -168,16 +168,21 @@ Status RegisterOpenCLKernels(KernelRegistry& kernel_registry) {
   // whose shape/index inputs are CPU-resident, or the op reads a host pointer
   // as a cl_mem. The shape ops (Shape/Gather/Unsqueeze/Squeeze/Reshape) are left
   // to the CPU EP — ORT's own shape-op policy — and the int64/int32 shape
-  // arithmetic stays on the CPU too. Only the float data-path ops are claimed.
+  // arithmetic stays on the CPU too. Only the float data-path ops are claimed,
+  // plus their fp16 twins (an fp16 graph hands us half tensors). Whether THIS
+  // device can run the fp16 ones is decided in GetCapability(): the registry is
+  // built once and is shared, so it cannot depend on the device.
   static const std::unordered_set<std::string> shape_ops = {
       "Shape", "Gather", "Unsqueeze", "Squeeze", "Reshape"};
   static const std::unordered_set<std::string> elem_ops = {
       "Add", "Sub", "Mul", "Div"};
-  auto is_float_only = [](const KernelDef& def) {
+  auto is_data_path = [](const KernelDef& def) {
     auto it = def.TypeConstraints().find("T");
     if (it == def.TypeConstraints().end()) return true;
-    return std::all_of(it->second.begin(), it->second.end(),
-                       [](MLDataType t) { return t == DataTypeImpl::GetTensorType<float>(); });
+    return std::all_of(it->second.begin(), it->second.end(), [](MLDataType t) {
+      return t == DataTypeImpl::GetTensorType<float>() ||
+             t == DataTypeImpl::GetTensorType<MLFloat16>();
+    });
   };
 
   for (auto& function_table_entry : function_table) {
@@ -185,7 +190,7 @@ Status RegisterOpenCLKernels(KernelRegistry& kernel_registry) {
     if (info.kernel_def == nullptr) continue;
     const std::string& op = info.kernel_def->OpName();
     if (shape_ops.count(op) > 0) continue;                                   // -> CPU
-    if (elem_ops.count(op) > 0 && !is_float_only(*info.kernel_def)) continue;  // int64 shape math -> CPU
+    if (elem_ops.count(op) > 0 && !is_data_path(*info.kernel_def)) continue;  // int64 shape math -> CPU
     VLOGS_DEFAULT(V_GENERIC) << "Register kernel name: " << op
                              << ", domain: " << info.kernel_def->Domain();
     ORT_RETURN_IF_ERROR(kernel_registry.Register(std::move(info)));
