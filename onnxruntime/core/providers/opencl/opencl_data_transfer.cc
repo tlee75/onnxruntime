@@ -47,6 +47,7 @@ Status OpenCLGPUDataTransfer::CopyTensor(const Tensor& src, Tensor& dst) const {
     if (src_device.MemType() == OrtDevice::MemType::DEFAULT) {
       VLOGF_DEFAULT(V_COPY, "Copy  Buffer(%p) -----> host(%p)", CL_BUFFER_FROM_TENSOR(src), dst.DataRaw());
       ORT_RETURN_IF_CL_ERROR(clEnqueueReadBuffer(exec_->GetCommandQueue(), CL_BUFFER_FROM_TENSOR(src), /*blocking_read=*/CL_TRUE, /*offset=*/0, dst.SizeInBytes(), dst.MutableDataRaw(), 0, nullptr, nullptr));
+      exec_->ProfDump();  // per-kernel GPU totals for this run (tune switch only)
       return Status::OK();
     }
   }

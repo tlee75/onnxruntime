@@ -372,7 +372,9 @@ Status OpenCLExecutionProvider::InitOpenCLContext() {
 #ifdef TRACY_ENABLE
   cmd_queue_ = clCreateCommandQueue(ctx_, dev_, CL_QUEUE_PROFILING_ENABLE, &err);
 #else
-  cmd_queue_ = clCreateCommandQueue(ctx_, dev_, /*properties=*/0, &err);
+  // The per-kernel profiler needs event timestamps on the main queue, so the tune
+  // switch arms it too. Shipped runs (switch off) keep properties=0.
+  cmd_queue_ = clCreateCommandQueue(ctx_, dev_, TuneEnabledLevel() ? CL_QUEUE_PROFILING_ENABLE : 0, &err);
 #endif
   ORT_RETURN_IF_CL_ERROR(err);
 
@@ -446,6 +448,49 @@ std::vector<AllocatorPtr> OpenCLExecutionProvider::CreatePreferredAllocators() {
 Status OpenCLExecutionProvider::Sync() const {
   ORT_RETURN_IF_CL_ERROR(clFinish(cmd_queue_));
   return Status::OK();
+}
+
+void OpenCLExecutionProvider::ProfRecord(const char* name, cl_event ev) const {
+  std::lock_guard<std::mutex> g(prof_mu_);
+  prof_entries_.push_back({name, ev});
+}
+
+void OpenCLExecutionProvider::ProfDump() const {
+  std::vector<ProfEntry> entries;
+  {
+    std::lock_guard<std::mutex> g(prof_mu_);
+    if (prof_entries_.empty()) return;
+    entries.swap(prof_entries_);
+  }
+  clFinish(cmd_queue_);
+
+  struct Agg { uint64_t n = 0, gpu = 0; };
+  std::unordered_map<std::string, Agg> agg;
+  for (auto& e : entries) {
+    uint64_t gpu = 0;
+    cl_ulong s = 0, t = 0;
+    if (e.ev &&
+        clGetEventProfilingInfo(e.ev, CL_PROFILING_COMMAND_START, sizeof(s), &s, nullptr) == CL_SUCCESS &&
+        clGetEventProfilingInfo(e.ev, CL_PROFILING_COMMAND_END, sizeof(t), &t, nullptr) == CL_SUCCESS) {
+      gpu = static_cast<uint64_t>(t - s);
+    }
+    auto& a = agg[e.name];
+    a.n++;
+    a.gpu += gpu;
+    if (e.ev) clReleaseEvent(e.ev);
+  }
+
+  std::vector<std::pair<std::string, Agg>> v(agg.begin(), agg.end());
+  std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.gpu > b.second.gpu; });
+  uint64_t tg = 0, tn = 0;
+  LOGS_DEFAULT(WARNING) << "[CLPROF] ===== per-kernel GPU time, " << entries.size() << " launches =====";
+  for (auto& kv : v) {
+    LOGS_DEFAULT(WARNING) << "[CLPROF] " << kv.first << " n=" << kv.second.n
+                          << " gpu_us=" << (kv.second.gpu / 1000);
+    tg += kv.second.gpu;
+    tn += kv.second.n;
+  }
+  LOGS_DEFAULT(WARNING) << "[CLPROF] TOTAL n=" << tn << " gpu_us=" << (tg / 1000);
 }
 
 #ifdef TRACY_ENABLE

@@ -143,6 +143,12 @@ class OpenCLExecutionProvider : public IExecutionProvider {
   /// KernelLauncher
   Status AfterCLLaunch() const;
 
+  /// Measurement-only (armed by the tune switch, see InitOpenCLContext): per-kernel
+  /// GPU timing. KernelLauncher calls ProfRecord() with the launch's profiling event;
+  /// ProfDump() clFinishes, sums the events per kernel name and logs the totals.
+  void ProfRecord(const char* name, cl_event ev) const;
+  void ProfDump() const;
+
   const std::string GetCompileOptions() const { return compile_options_; };
 
   /// OpenCLKernel use it to initialize OpenCLKernelHolder
@@ -180,6 +186,15 @@ class OpenCLExecutionProvider : public IExecutionProvider {
   // scratch buffer is handed back out instead of churning the allocator.
   mutable std::unordered_map<cl_mem, size_t> scratch_size_;
   mutable std::unordered_map<size_t, std::vector<cl_mem>> scratch_pool_;
+
+  // Per-kernel GPU timing (see ProfRecord/ProfDump). Empty unless the tune switch
+  // armed the profiler, so a shipped run never allocates an event.
+  struct ProfEntry {
+    std::string name;
+    cl_event ev;
+  };
+  mutable std::mutex prof_mu_;
+  mutable std::vector<ProfEntry> prof_entries_;
 
  private:
   std::unique_ptr<opencl::OpenCLProgramManager> program_manager_;

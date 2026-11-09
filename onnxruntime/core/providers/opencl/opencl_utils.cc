@@ -244,8 +244,13 @@ Status KernelLauncher::Launch(const OpenCLExecutionProvider& exec, const NDRange
     TracyCLNamedZoneSetEvent(_tracy_cl_launch, kernel_launch_event);
   }
 #else
+  cl_event _ev = nullptr;
   ORT_RETURN_IF_CL_ERROR(clEnqueueNDRangeKernel(exec.GetCommandQueue(), kernel_, global_.Size(), nullptr,
-                                                global_.Data(), local_.Data(), 0, nullptr, nullptr));
+                                                global_.Data(), local_.Data(), 0, nullptr,
+                                                exec.TuneEnabledLevel() ? &_ev : nullptr));
+  if (exec.TuneEnabledLevel()) {
+    const_cast<OpenCLExecutionProvider&>(exec).ProfRecord(GetKernelFunctionName().c_str(), _ev);
+  }
 #endif
   return exec.AfterCLLaunch();
 }
