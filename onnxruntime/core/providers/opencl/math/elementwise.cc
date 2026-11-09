@@ -114,6 +114,8 @@ REG_ELEMENTWISE_TYPED_KERNEL_CLASS(Add, 14, float, add_float);
 REG_ELEMENTWISE_TYPED_KERNEL_CLASS(Add, 14, double, add_double);
 REG_ELEMENTWISE_TYPED_KERNEL_CLASS(Add, 14, int32_t, add_int);
 REG_ELEMENTWISE_TYPED_KERNEL_CLASS(Add, 14, int64_t, add_long);
+ELEMENT_WISE_OP_IMPL(add_fp16, MLFloat16);
+REG_ELEMENTWISE_TYPED_KERNEL_CLASS(Add, 14, MLFloat16, add_fp16);
 
 ELEMENT_WISE_OP_IMPL(div_float, float);
 ELEMENT_WISE_OP_IMPL(div_double, double);
@@ -123,6 +125,8 @@ REG_ELEMENTWISE_TYPED_KERNEL_CLASS(Div, 14, float, div_float);
 REG_ELEMENTWISE_TYPED_KERNEL_CLASS(Div, 14, double, div_double);
 REG_ELEMENTWISE_TYPED_KERNEL_CLASS(Div, 14, int32_t, div_int);
 REG_ELEMENTWISE_TYPED_KERNEL_CLASS(Div, 14, int64_t, div_long);
+ELEMENT_WISE_OP_IMPL(div_fp16, MLFloat16);
+REG_ELEMENTWISE_TYPED_KERNEL_CLASS(Div, 14, MLFloat16, div_fp16);
 
 ELEMENT_WISE_OP_IMPL(mul_float, float);
 ELEMENT_WISE_OP_IMPL(mul_double, double);
@@ -132,6 +136,8 @@ REG_ELEMENTWISE_TYPED_KERNEL_CLASS(Mul, 14, float, mul_float);
 REG_ELEMENTWISE_TYPED_KERNEL_CLASS(Mul, 14, double, mul_double);
 REG_ELEMENTWISE_TYPED_KERNEL_CLASS(Mul, 14, int32_t, mul_int);
 REG_ELEMENTWISE_TYPED_KERNEL_CLASS(Mul, 14, int64_t, mul_long);
+ELEMENT_WISE_OP_IMPL(mul_fp16, MLFloat16);
+REG_ELEMENTWISE_TYPED_KERNEL_CLASS(Mul, 14, MLFloat16, mul_fp16);
 
 ELEMENT_WISE_OP_IMPL(sub_float, float);
 ELEMENT_WISE_OP_IMPL(sub_double, double);
@@ -141,8 +147,11 @@ REG_ELEMENTWISE_TYPED_KERNEL_CLASS(Sub, 14, float, sub_float);
 REG_ELEMENTWISE_TYPED_KERNEL_CLASS(Sub, 14, double, sub_double);
 REG_ELEMENTWISE_TYPED_KERNEL_CLASS(Sub, 14, int32_t, sub_int);
 REG_ELEMENTWISE_TYPED_KERNEL_CLASS(Sub, 14, int64_t, sub_long);
+ELEMENT_WISE_OP_IMPL(sub_fp16, MLFloat16);
+REG_ELEMENTWISE_TYPED_KERNEL_CLASS(Sub, 14, MLFloat16, sub_fp16);
 
 ELEMENT_WISE_OP_IMPL(pow_float, float);
+ELEMENT_WISE_OP_IMPL(pow_fp16, MLFloat16);
 
 ONNX_OPERATOR_VERSIONED_KERNEL_EX(
     Pow,
@@ -152,6 +161,9 @@ ONNX_OPERATOR_VERSIONED_KERNEL_EX(
     KernelDefBuilder()
         .TypeConstraint("T", DataTypeImpl::GetTensorType<float>()),
     pow_float)
+// Pow's fp16 registration shares this versioned range: the op is the same op, the
+// kernel differs only in the tensor dtype and the kernel name baked into its class.
+REG_ELEMENTWISE_VERSIONED_TYPED_KERNEL(Pow, 13, 14, MLFloat16, pow_fp16);
 
 #define ELEMENT_LOGICAL_OP_IMPL(CLASS_NAME, type)                                                                       \
   class CLASS_NAME : public OpenCLKernel {                                                                              \
