@@ -123,26 +123,19 @@ class Conv : public OpenCLKernel {
       const size_t gn_used = std::min(gn, std::max<size_t>(1, cap0 / lx));
 
       if (k_i == 1 && stride == 1 && pad_l == 0) {
-        // 1x1 conv: X is already [C, W] == [Kdim, Wout]; a plain GEMM. Named so the
-        // tune switch can time it on the EP's tune queue and log the GPU time (the
-        // same treatment the fused-conv path gets); with the switch off this is the
-        // same plain Launch as before.
-        KernelLauncher kl1{GetKernel(GemmKernel())};
-        kl1.SetArg<cl_int>(m_i)
-            .SetArg<cl_int>(wout_i)
-            .SetArg<cl_int>(kdim)
-            .SetArg<cl_int>(has_bias)
-            .SetArg<cl_int>(0)  // trans_a: A is [M, Kdim] (the conv weight)
-            .SetBuffer(a)
-            .SetBuffer(x)
-            .SetBuffer(y)
-            .SetBuffer(bias);
-        if (exec_->TuneEnabledLevel()) {
-          const double us = kl1.TimeOnTuneQueue(*exec_, NDRange(gn_used * lx, gm * ly), NDRange(lx, ly));
-          LOGS_DEFAULT(WARNING) << "[CL] conv1x1 gemm " << GemmKernel() << " us=" << us
-                                << " M=" << m_i << " Wout=" << wout_i << " kdim=" << kdim;
-        }
-        ORT_RETURN_IF_ERROR(kl1.Launch(*exec_, NDRange(gn_used * lx, gm * ly), NDRange(lx, ly)));
+        // 1x1 conv: X is already [C, W] == [Kdim, Wout]; a plain GEMM.
+        ORT_RETURN_IF_ERROR(
+            KernelLauncher{GetKernel(GemmKernel())}
+                .SetArg<cl_int>(m_i)
+                .SetArg<cl_int>(wout_i)
+                .SetArg<cl_int>(kdim)
+                .SetArg<cl_int>(has_bias)
+                .SetArg<cl_int>(0)  // trans_a: A is [M, Kdim] (the conv weight)
+                .SetBuffer(a)
+                .SetBuffer(x)
+                .SetBuffer(y)
+                .SetBuffer(bias)
+                .Launch(*exec_, NDRange(gn_used * lx, gm * ly), NDRange(lx, ly)));
       } else {
         // General conv: fuse im2col into the GEMM.
         //

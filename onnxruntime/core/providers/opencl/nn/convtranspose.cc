@@ -114,28 +114,18 @@ class ConvTranspose : public OpenCLKernel {
       const size_t gn = (static_cast<size_t>(w_i) + kGemmBN - 1) / kGemmBN;
       const size_t gm = (static_cast<size_t>(mk) + kGemmBM - 1) / kGemmBM;
       const size_t gn_used = std::min(gn, std::max<size_t>(1, cap0 / lx));
-      {
-        // Split so the launcher can be named: this GEMM path has no tile choice, so
-        // with the tune switch on we time it on the EP's tune queue and log the GPU
-        // time, giving it the same visibility the fused-conv path has. With the
-        // switch off (the shipped configuration) this is the same plain Launch.
-        KernelLauncher kl{GetKernel(GemmKernel())};
-        kl.SetArg<cl_int>(mk)
-            .SetArg<cl_int>(w_i)
-            .SetArg<cl_int>(c_i)
-            .SetArg<cl_int>(0)  // bias applied by Col2im below
-            .SetArg<cl_int>(1)  // trans_a: A is the [C, M*K] weight
-            .SetBuffer(wt)
-            .SetBuffer(x)
-            .SetBuffer(p)
-            .SetBuffer(bias);
-        if (exec_->TuneEnabledLevel()) {
-          const double us = kl.TimeOnTuneQueue(*exec_, NDRange(gn_used * lx, gm * ly), NDRange(lx, ly));
-          LOGS_DEFAULT(WARNING) << "[CL] convtranspose gemm " << GemmKernel() << " us=" << us
-                                << " mk=" << mk << " w=" << w_i << " c=" << c_i;
-        }
-        ORT_RETURN_IF_ERROR(kl.Launch(*exec_, NDRange(gn_used * lx, gm * ly), NDRange(lx, ly)));
-      }
+      ORT_RETURN_IF_ERROR(
+          KernelLauncher{GetKernel(GemmKernel())}
+              .SetArg<cl_int>(mk)
+              .SetArg<cl_int>(w_i)
+              .SetArg<cl_int>(c_i)
+              .SetArg<cl_int>(0)  // bias applied by Col2im below
+              .SetArg<cl_int>(1)  // trans_a: A is the [C, M*K] weight
+              .SetBuffer(wt)
+              .SetBuffer(x)
+              .SetBuffer(p)
+              .SetBuffer(bias)
+              .Launch(*exec_, NDRange(gn_used * lx, gm * ly), NDRange(lx, ly)));
 
       // Y[m, ow] = B[m] + sum_k P[m*K + k, (ow + pad - k*dil)/stride]
       ORT_RETURN_IF_ERROR(
