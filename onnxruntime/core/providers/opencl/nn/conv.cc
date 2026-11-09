@@ -71,6 +71,8 @@ class Conv : public OpenCLKernel {
       LoadKernel("Gemm_Tiled_Conv_H_TM8");
       LoadKernel("Gemm_Tiled_Conv_H_NG");
       LoadKernel("Gemm_Tiled_Conv_H_PB");
+      LoadKernel("Gemm_Tiled_Conv_H_IMG");
+      LoadKernel("ImgFillX");
     }
   }
 
@@ -168,6 +170,36 @@ class Conv : public OpenCLKernel {
         // asked for it (half the local memory => better occupancy, half2 MAC).
         const bool f16 = exec_->SupportsFp16() && exec_->UseFp16();
         const bool h = IsHalf(*X);
+        // DEV-ONLY (ORT_OPENCL_EXP=image2d): X sampled from a CL_RGBA/CL_HALF_FLOAT
+        // image2d (4 columns per texel) instead of gathered from a buffer. w_i % 4 == 0
+        // keeps the texel packing exact; any failure falls through to the buffer path.
+        if (h && exec_->Exp() == "image2d" && (w_i % 4) == 0 && w_i > 0 && c_i > 0) {
+          if (cl_mem xi = FillImageFromX(x, c_i, w_i)) {
+            const size_t lx = 64 / static_cast<size_t>(kGemmTN);
+            const size_t ly = 64 / static_cast<size_t>(kGemmTM);
+            const size_t gm = (static_cast<size_t>(m_i) + 63) / 64;
+            const size_t gn = (static_cast<size_t>(wout_i) + 63) / 64;
+            const size_t gn_used = std::min(gn, std::max<size_t>(1, cap0 / lx));
+            KernelLauncher kl_img{GetKernel("Gemm_Tiled_Conv_H_IMG")};
+            kl_img.SetArg<cl_int>(m_i)
+                .SetArg<cl_int>(wout_i)
+                .SetArg<cl_int>(c_i)
+                .SetArg<cl_int>(w_i)
+                .SetArg<cl_int>(k_i)
+                .SetArg<cl_int>(static_cast<cl_int>(stride))
+                .SetArg<cl_int>(static_cast<cl_int>(pad_l))
+                .SetArg<cl_int>(static_cast<cl_int>(dilation))
+                .SetArg<cl_int>(has_bias)
+                .SetBuffer(a)
+                .SetImage2D(xi)
+                .SetBuffer(y)
+                .SetBuffer(bias);
+            ORT_RETURN_IF_ERROR(
+                kl_img.Launch(*exec_, NDRange(gn_used * lx, gm * ly), NDRange(lx, ly)));
+            return Status::OK();
+          }
+          LOGS_DEFAULT(WARNING) << "[CL] image2d path unavailable; using buffers";
+        }
         // DEV-ONLY A/B variants selected by ORT_OPENCL_EXP; both are half-storage and
         // use the same 64x64 tile/work-group, so only the kernel differs:
         //   conv_tm8      - TM=TN=8 (a 4x larger per-thread register block)
@@ -340,6 +372,54 @@ class Conv : public OpenCLKernel {
   // enableAutoTune: chosen fused-conv tile per (M, Wout, Kdim, fp16).
   mutable std::mutex tile_mu_;
   mutable std::map<std::array<int, 4>, std::array<size_t, 2>> tile_choice_;
+
+  // DEV-ONLY (ORT_OPENCL_EXP=image2d): a cached CL_RGBA/CL_HALF_FLOAT image holding
+  // X ([C, W] halfs, 4 columns per texel), refilled from X each call. Deliberately
+  // never released -- the test is process-lifetime, and the real fast path would
+  // keep activations resident as images instead of copying per op.
+  mutable std::mutex img_mu_;
+  mutable cl_mem img_ = nullptr;
+  mutable int img_c_ = 0;
+  mutable int img_wq_ = 0;
+
+  /// DEV-ONLY (ORT_OPENCL_EXP=image2d): make the cached image match X's [C, W] and
+  /// refill it via ImgFillX. nullptr on any failure, so the caller falls back to the
+  /// buffer kernel.
+  cl_mem FillImageFromX(cl_mem x, int c_i, int w_i) const {
+    const int wq = w_i / 4;  // texel columns; the caller guarantees w_i % 4 == 0
+    std::lock_guard<std::mutex> guard(img_mu_);
+    if (img_ == nullptr || img_c_ != c_i || img_wq_ != wq) {
+      if (img_ != nullptr) clReleaseMemObject(img_);
+      cl_image_format fmt{};
+      fmt.image_channel_order = CL_RGBA;
+      fmt.image_channel_data_type = CL_HALF_FLOAT;
+      cl_image_desc desc{};
+      desc.image_type = CL_MEM_OBJECT_IMAGE2D;
+      desc.image_width = static_cast<size_t>(wq);
+      desc.image_height = static_cast<size_t>(c_i);
+      cl_int err = CL_SUCCESS;
+      img_ = clCreateImage(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, &fmt, &desc, nullptr, &err);
+      if (err != CL_SUCCESS || img_ == nullptr) {
+        LOGS_DEFAULT(WARNING) << "[CL] image2d create failed: " << err;
+        img_ = nullptr;
+        return nullptr;
+      }
+      img_c_ = c_i;
+      img_wq_ = wq;
+    }
+    const Status st =
+        KernelLauncher{GetKernel("ImgFillX")}
+            .SetBuffer(x)
+            .SetArg<cl_int>(c_i)
+            .SetArg<cl_int>(w_i)
+            .SetImage2D(img_)
+            .Launch(*exec_, NDRange(static_cast<size_t>(wq), static_cast<size_t>(c_i)));
+    if (!st.IsOK()) {
+      LOGS_DEFAULT(WARNING) << "[CL] image2d fill failed: " << st.ErrorMessage();
+      return nullptr;
+    }
+    return img_;
+  }
 };
 
 ONNX_OPENCL_OPERATOR_KERNEL(

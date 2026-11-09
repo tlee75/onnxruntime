@@ -406,4 +406,118 @@ DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_H_NG, 64, 64, 32, 4, 4, 1, 0)
 // A/B (ORT_OPENCL_EXP=conv_packb): read B as ONE packed half2 LDS op instead of
 // two 16-bit reads plus a pack (the per-FMA-overhead hypothesis). Dev-only.
 DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_H_PB, 64, 64, 32, 4, 4, 0, 1)
+
+// DEV-ONLY (ORT_OPENCL_EXP=image2d): the same half-storage fused conv, but the
+// activation X is bound as a CL_RGBA/CL_HALF_FLOAT image2d -- 4 consecutive columns
+// per texel -- and the im2col read becomes a texture SAMPLE instead of a buffer
+// gather. The host creates/caches the image and copies X into it each call. This
+// exists ONLY to price the texture path against the buffer path with the paired
+// harness; it is not for the upstream series. Note the confound: this variant
+// keeps the plain A load and Y store (no packed variants), so it is ~a few percent
+// behind the production kernel before the B load is even considered.
+#define DEFINE_GEMM_TILED_CONV_H_IMG(NAME, BM, BN, BK, TM, TN)                  \
+  __kernel __attribute__((reqd_work_group_size(BN / TN, BM / TM, 1)))           \
+  void NAME(const int M, const int Wout, const int C, const int W,              \
+            const int K, const int stride, const int pad, const int dil,        \
+            const int has_bias,                                                 \
+            __global const half* Wt, __read_only image2d_t X,                   \
+            __global half* Y, __global const half* B) {                         \
+    const sampler_t smp = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP_TO_EDGE | CLK_FILTER_NEAREST; \
+    const int lx = get_local_id(0);                                             \
+    const int ly = get_local_id(1);                                             \
+    const int tid = ly * get_local_size(0) + lx;                                \
+    const int nthreads = get_local_size(0) * get_local_size(1);                 \
+    __local half As[BM][BK];                                                    \
+    __local half Bs[BK][BN];                                                    \
+    const int row0 = get_group_id(1) * BM;                                      \
+    const int Kdim = C * K;                                                     \
+    half bias_r[TM];                                                            \
+    for (int i = 0; i < TM; ++i) {                                              \
+      const int gr = row0 + ly * TM + i;                                        \
+      bias_r[i] = ((has_bias && gr < M) ? B[gr] : (half)0);                     \
+    }                                                                           \
+    const int numNtiles = (Wout + BN - 1) / BN;                                 \
+    for (int nt = get_group_id(0); nt < numNtiles; nt += get_num_groups(0)) {   \
+      const int col0 = nt * BN;                                                 \
+      half2 acc2[TM][TN / 2];                                                    \
+      for (int i = 0; i < TM; ++i)                                              \
+        for (int j2 = 0; j2 < TN / 2; ++j2)                                     \
+          acc2[i][j2] = (half2)(bias_r[i], bias_r[i]);                          \
+      for (int k0 = 0; k0 < Kdim; k0 += BK) {                                   \
+        for (int idx = tid; idx < BM * BK; idx += nthreads) {                   \
+          const int i = idx / BK;                                               \
+          const int kk = idx % BK;                                              \
+          const int gr = row0 + i;                                              \
+          const int gk = k0 + kk;                                               \
+          As[i][kk] = ((gr < M && gk < Kdim) ? Wt[gr * Kdim + gk] : (half)0);   \
+        }                                                                       \
+        for (int idx = tid; idx < BK * BN; idx += nthreads) {                   \
+          const int kk = idx / BN;                                              \
+          const int j = idx % BN;                                               \
+          const int gk = k0 + kk;                                               \
+          const int ow = col0 + j;                                              \
+          half v = (half)0;                                                     \
+          if (gk < Kdim && ow < Wout) {                                         \
+            const int c = gk / K;                                               \
+            const int tap = gk - c * K;                                         \
+            const int iw = ow * stride - pad + tap * dil;                       \
+            if (iw >= 0 && iw < W) {                                            \
+              const half4 t = read_imageh(X, smp, (int2)(iw >> 2, c));          \
+              switch (iw & 3) {                                                 \
+                case 0: v = t.x; break;                                         \
+                case 1: v = t.y; break;                                         \
+                case 2: v = t.z; break;                                         \
+                default: v = t.w; break;                                        \
+              }                                                                 \
+            }                                                                   \
+          }                                                                     \
+          Bs[kk][j] = v;                                                        \
+        }                                                                       \
+        barrier(CLK_LOCAL_MEM_FENCE);                                           \
+        for (int kk = 0; kk < BK; ++kk) {                                       \
+          half a[TM];                                                           \
+          for (int i = 0; i < TM; ++i) a[i] = As[ly * TM + i][kk];              \
+          for (int j2 = 0; j2 < TN / 2; ++j2) {                                 \
+            const int jc = lx * TN + 2 * j2;                                    \
+            const half2 b2 = (half2)(Bs[kk][jc], Bs[kk][jc + 1]);               \
+            for (int i = 0; i < TM; ++i)                                        \
+              acc2[i][j2] = (half2)(a[i], a[i]) * b2 + acc2[i][j2];             \
+          }                                                                     \
+        }                                                                       \
+        barrier(CLK_LOCAL_MEM_FENCE);                                           \
+      }                                                                         \
+      for (int i = 0; i < TM; ++i) {                                            \
+        const int gr = row0 + ly * TM + i;                                      \
+        if (gr >= M) continue;                                                  \
+        for (int j2 = 0; j2 < TN / 2; ++j2) {                                   \
+          const int gc = col0 + lx * TN + 2 * j2;                               \
+          if (gc < Wout) Y[gr * Wout + gc] = acc2[i][j2].lo;                    \
+          if (gc + 1 < Wout) Y[gr * Wout + gc + 1] = acc2[i][j2].hi;            \
+        }                                                                       \
+      }                                                                         \
+      barrier(CLK_LOCAL_MEM_FENCE);                                             \
+    }                                                                           \
+  }
+
+// The A/B arm: the same tile, texture-sampled X.
+DEFINE_GEMM_TILED_CONV_H_IMG(Gemm_Tiled_Conv_H_IMG, 64, 64, 32, 4, 4)
+
+// DEV-ONLY (ORT_OPENCL_EXP=image2d): fill the CL_RGBA/CL_HALF_FLOAT image from X
+// ([C, W] halfs, 4 consecutive columns per texel). Done with a kernel rather than
+// clEnqueueCopyBufferToImage because the latter assumes the buffer's row pitch
+// matches the image's (implementation-chosen) pitch, which our tightly packed X
+// does not guarantee.
+__kernel void ImgFillX(__global const half* X, const int C, const int W,
+                       __write_only image2d_t Dst) {
+  const int x = get_global_id(0);
+  const int c = get_global_id(1);
+  if (c >= C || x * 4 >= W) return;
+  const int iw = x * 4;
+  half4 v = (half4)((half)0, (half)0, (half)0, (half)0);
+  v.x = X[c * W + iw];
+  if (iw + 1 < W) v.y = X[c * W + iw + 1];
+  if (iw + 2 < W) v.z = X[c * W + iw + 2];
+  if (iw + 3 < W) v.w = X[c * W + iw + 3];
+  write_imageh(Dst, (int2)(x, c), v);
+}
 #endif
