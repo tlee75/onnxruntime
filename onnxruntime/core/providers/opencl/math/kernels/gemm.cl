@@ -238,4 +238,88 @@ void Gemm_Tiled_F16(
     barrier(CLK_LOCAL_MEM_FENCE);
   }
 }
+
+// Same tiling and the same half2 accumulate as Gemm_Tiled_F16, but the operands
+// and the result are half *in memory* -- the storage strategy of an fp16 graph
+// (and of LiteRT's GPU delegate). The fp32-storage F16 variant above converts each
+// element on load and on store; here the bytes moved are already half.
+void Gemm_Tiled_F16H(
+    const int M,
+    const int N,
+    const int K,
+    const int has_bias,
+    const int trans_a,
+    __global const half* A,
+    __global const half* B,
+    __global half* C,
+    __global const half* Bias) {
+  const int lx = get_local_id(0);
+  const int ly = get_local_id(1);
+  const int tid = ly * get_local_size(0) + lx;
+  const int nthreads = get_local_size(0) * get_local_size(1);
+
+  // +2 (one 4-byte bank) so that filling As[i][kk] with consecutive threads on
+  // consecutive `i` (the trans_a / ConvTranspose layout) does not land every
+  // thread in the same local-memory bank.
+  __local half As[GEMM_BM][GEMM_BK + 2];
+  __local half Bs[GEMM_BK][GEMM_BN];
+
+  const int row0 = get_group_id(1) * GEMM_BM;
+  half bias_r[GEMM_TM];
+  for (int i = 0; i < GEMM_TM; ++i) {
+    const int gr = row0 + ly * GEMM_TM + i;
+    bias_r[i] = (has_bias && gr < M) ? Bias[gr] : (half)0;
+  }
+  const int numNtiles = (N + GEMM_BN - 1) / GEMM_BN;
+
+  for (int nt = get_group_id(0); nt < numNtiles; nt += get_num_groups(0)) {
+    const int col0 = nt * GEMM_BN;
+
+    half2 acc2[GEMM_TM][GEMM_TN / 2];
+    for (int i = 0; i < GEMM_TM; ++i)
+      for (int j2 = 0; j2 < GEMM_TN / 2; ++j2)
+        acc2[i][j2] = (half2)(bias_r[i], bias_r[i]);
+
+    for (int k0 = 0; k0 < K; k0 += GEMM_BK) {
+      for (int idx = tid; idx < GEMM_BM * GEMM_BK; idx += nthreads) {
+        const int i = trans_a ? (idx % GEMM_BM) : (idx / GEMM_BK);
+        const int kk = trans_a ? (idx / GEMM_BM) : (idx % GEMM_BK);
+        const int gr = row0 + i;
+        const int gk = k0 + kk;
+        As[i][kk] = (gr < M && gk < K) ? A[trans_a ? (gk * M + gr) : (gr * K + gk)] : (half)0;
+      }
+      for (int idx = tid; idx < GEMM_BK * GEMM_BN; idx += nthreads) {
+        const int kk = idx / GEMM_BN;
+        const int j = idx % GEMM_BN;
+        const int gk = k0 + kk;
+        const int gc = col0 + j;
+        Bs[kk][j] = (gk < K && gc < N) ? B[gk * N + gc] : (half)0;
+      }
+      barrier(CLK_LOCAL_MEM_FENCE);
+
+      for (int kk = 0; kk < GEMM_BK; ++kk) {
+        half a[GEMM_TM];
+        for (int i = 0; i < GEMM_TM; ++i) a[i] = As[ly * GEMM_TM + i][kk];
+        for (int j2 = 0; j2 < GEMM_TN / 2; ++j2) {
+          const int jc = lx * GEMM_TN + 2 * j2;
+          const half2 b2 = (half2)(Bs[kk][jc], Bs[kk][jc + 1]);
+          for (int i = 0; i < GEMM_TM; ++i)
+            acc2[i][j2] = (half2)(a[i], a[i]) * b2 + acc2[i][j2];
+        }
+      }
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    for (int i = 0; i < GEMM_TM; ++i) {
+      const int gr = row0 + ly * GEMM_TM + i;
+      if (gr >= M) continue;
+      for (int j2 = 0; j2 < GEMM_TN / 2; ++j2) {
+        const int gc = col0 + lx * GEMM_TN + 2 * j2;
+        if (gc < N) C[gr * N + gc] = acc2[i][j2].lo;
+        if (gc + 1 < N) C[gr * N + gc + 1] = acc2[i][j2].hi;
+      }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+}
 #endif

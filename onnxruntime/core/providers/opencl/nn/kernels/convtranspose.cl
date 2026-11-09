@@ -99,3 +99,38 @@ __kernel void ConvTranspose_Col2im(
     Y[m * Wout + ow] = acc;
   }
 }
+
+#if defined(cl_khr_fp16)
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+
+// Half-storage twin of the col2im gather: an fp16 graph hands us half P/Y, so the
+// scatter-accumulate runs in half (matching the half-accumulating GEMM above it).
+__kernel void ConvTranspose_Col2im_F16H(
+    const int M,
+    const int K,
+    const int W,
+    const int Wout,
+    const int stride,
+    const int pad,
+    const int dil,
+    const int has_bias,
+    __global const half* P,
+    __global const half* B,
+    __global half* Y) {
+  const int m = get_global_id(1);
+  if (m >= M) return;
+  const int g0 = get_global_size(0);
+  const half bias = has_bias ? B[m] : (half)0;
+  for (int ow = get_global_id(0); ow < Wout; ow += g0) {
+    half acc = bias;
+    for (int k = 0; k < K; ++k) {
+      const int num = ow + pad - k * dil;
+      if (num >= 0 && (num % stride) == 0) {
+        const int iw = num / stride;
+        if (iw < W) acc += P[(m * K + k) * W + iw];
+      }
+    }
+    Y[m * Wout + ow] = acc;
+  }
+}
+#endif

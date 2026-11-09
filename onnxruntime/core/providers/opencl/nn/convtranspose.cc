@@ -48,13 +48,23 @@ class ConvTranspose : public OpenCLKernel {
     LoadKernel("ConvTranspose1D_Float");
     LoadKernel("ConvTranspose_Col2im");
     LoadKernel("Gemm_Tiled");
-    if (exec_->SupportsFp16()) LoadKernel("Gemm_Tiled_F16");
+    if (exec_->SupportsFp16()) {
+      LoadKernel("Gemm_Tiled_F16");
+      // Half-*storage* twins for an fp16 graph (its tensors are half).
+      LoadKernel("Gemm_Tiled_F16H");
+      LoadKernel("ConvTranspose_Col2im_F16H");
+    }
   }
 
   // See Conv::GemmKernel: fp16 only when the device supports it AND the session
   // asked for fp16.
-  const char* GemmKernel() const {
+  const char* GemmKernel(bool h) const {
+    if (h) return "Gemm_Tiled_F16H";
     return (exec_->SupportsFp16() && exec_->UseFp16()) ? "Gemm_Tiled_F16" : "Gemm_Tiled";
+  }
+
+  static bool IsHalf(const Tensor& t) {
+    return t.DataType() == DataTypeImpl::GetTensorType<MLFloat16>();
   }
 
   Status Compute(OpKernelContext* context) const override {
@@ -115,7 +125,7 @@ class ConvTranspose : public OpenCLKernel {
       const size_t gm = (static_cast<size_t>(mk) + kGemmBM - 1) / kGemmBM;
       const size_t gn_used = std::min(gn, std::max<size_t>(1, cap0 / lx));
       ORT_RETURN_IF_ERROR(
-          KernelLauncher{GetKernel(GemmKernel())}
+          KernelLauncher{GetKernel(GemmKernel(IsHalf(*X)))}
               .SetArg<cl_int>(mk)
               .SetArg<cl_int>(w_i)
               .SetArg<cl_int>(c_i)
@@ -129,7 +139,7 @@ class ConvTranspose : public OpenCLKernel {
 
       // Y[m, ow] = B[m] + sum_k P[m*K + k, (ow + pad - k*dil)/stride]
       ORT_RETURN_IF_ERROR(
-          KernelLauncher{GetKernel("ConvTranspose_Col2im")}
+          KernelLauncher{GetKernel(IsHalf(*X) ? "ConvTranspose_Col2im_F16H" : "ConvTranspose_Col2im")}
               .SetArg<cl_int>(m_i)
               .SetArg<cl_int>(k_i)
               .SetArg<cl_int>(w_i)
@@ -183,7 +193,8 @@ ONNX_OPENCL_OPERATOR_KERNEL(
     ConvTranspose,
     11,
     KernelDefBuilder()
-        .TypeConstraint("T", DataTypeImpl::GetTensorType<float>()),
+        .TypeConstraint("T", {DataTypeImpl::GetTensorType<float>(),
+                              DataTypeImpl::GetTensorType<MLFloat16>()}),
     ConvTranspose);
 
 }  // namespace opencl

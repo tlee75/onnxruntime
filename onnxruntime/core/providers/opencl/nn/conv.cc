@@ -61,13 +61,26 @@ class Conv : public OpenCLKernel {
       LoadKernel("Gemm_Tiled_Conv_BM32_F16");
       LoadKernel("Gemm_Tiled_Conv_BM16_F16");
       LoadKernel("Gemm_Tiled_Conv_BN32_F16");
+      // Half-*storage* twins: for an fp16 graph the tensors themselves are half.
+      LoadKernel("Gemm_Tiled_F16H");
+      LoadKernel("Gemm_Tiled_Conv_H");
+      LoadKernel("Gemm_Tiled_Conv_BM32_H");
+      LoadKernel("Gemm_Tiled_Conv_BM16_H");
+      LoadKernel("Gemm_Tiled_Conv_BN32_H");
     }
   }
 
   // The GEMM kernel to use: the fp16 variant when the device supports it AND the
   // session asked for fp16 (addOpenCL(useFp16, …)); otherwise the fp32 one.
-  const char* GemmKernel() const {
+  const char* GemmKernel(bool h) const {
+    if (h) return "Gemm_Tiled_F16H";
     return (exec_->SupportsFp16() && exec_->UseFp16()) ? "Gemm_Tiled_F16" : "Gemm_Tiled";
+  }
+
+  /// True when the tensor is half, i.e. an fp16 graph: its storage is half, so the
+  /// *_F16H kernels (not the fp32-storage *_F16 ones) are the matching pair.
+  static bool IsHalf(const Tensor& t) {
+    return t.DataType() == DataTypeImpl::GetTensorType<MLFloat16>();
   }
 
   Status Compute(OpKernelContext* context) const override {
@@ -125,7 +138,7 @@ class Conv : public OpenCLKernel {
       if (k_i == 1 && stride == 1 && pad_l == 0) {
         // 1x1 conv: X is already [C, W] == [Kdim, Wout]; a plain GEMM.
         ORT_RETURN_IF_ERROR(
-            KernelLauncher{GetKernel(GemmKernel())}
+            KernelLauncher{GetKernel(GemmKernel(IsHalf(*X)))}
                 .SetArg<cl_int>(m_i)
                 .SetArg<cl_int>(wout_i)
                 .SetArg<cl_int>(kdim)
@@ -150,7 +163,8 @@ class Conv : public OpenCLKernel {
         // The fp16 twin is used when the device supports fp16 and the session
         // asked for it (half the local memory => better occupancy, half2 MAC).
         const bool f16 = exec_->SupportsFp16() && exec_->UseFp16();
-        const ConvTile tile = ChooseConvTile(m_i, wout_i, cap0, f16, a, x, y, bias,
+        const bool h = IsHalf(*X);
+        const ConvTile tile = ChooseConvTile(m_i, wout_i, cap0, f16, h, a, x, y, bias,
                                              c_i, w_i, k_i, static_cast<int>(stride),
                                              static_cast<int>(pad_l),
                                              static_cast<int>(dilation), has_bias);
@@ -159,7 +173,7 @@ class Conv : public OpenCLKernel {
         const size_t fgm = (static_cast<size_t>(m_i) + tile.bm - 1) / tile.bm;
         const size_t fgn = (static_cast<size_t>(wout_i) + tile.bn - 1) / tile.bn;
         const size_t fgn_used = std::min(fgn, std::max<size_t>(1, cap0 / flx));
-        KernelLauncher kl{GetKernel(ConvTileKernel(tile, f16))};
+        KernelLauncher kl{GetKernel(ConvTileKernel(tile, f16, h))};
         BindConvGemm(kl, a, x, y, bias, m_i, wout_i, c_i, w_i, k_i,
                      static_cast<int>(stride), static_cast<int>(pad_l),
                      static_cast<int>(dilation), has_bias);
@@ -198,7 +212,13 @@ class Conv : public OpenCLKernel {
     size_t bm, bn;
   };
 
-  static const char* ConvTileKernel(const ConvTile& t, bool f16) {
+  static const char* ConvTileKernel(const ConvTile& t, bool f16, bool h) {
+    if (h) {
+      if (t.bm == 16) return "Gemm_Tiled_Conv_BM16_H";
+      if (t.bm == 32) return "Gemm_Tiled_Conv_BM32_H";
+      if (t.bn == 32) return "Gemm_Tiled_Conv_BN32_H";
+      return "Gemm_Tiled_Conv_H";
+    }
     if (t.bm == 16) return f16 ? "Gemm_Tiled_Conv_BM16_F16" : "Gemm_Tiled_Conv_BM16";
     if (t.bm == 32) return f16 ? "Gemm_Tiled_Conv_BM32_F16" : "Gemm_Tiled_Conv_BM32";
     if (t.bn == 32) return f16 ? "Gemm_Tiled_Conv_BN32_F16" : "Gemm_Tiled_Conv_BN32";
@@ -226,7 +246,7 @@ class Conv : public OpenCLKernel {
   // Pick the fused-conv GEMM tile: the default heuristic, or -- with
   // enableAutoTune -- whichever of the candidates is fastest for this shape
   // (timed once per shape and cached).
-  ConvTile ChooseConvTile(int m_i, int wout_i, size_t cap0, bool f16,
+  ConvTile ChooseConvTile(int m_i, int wout_i, size_t cap0, bool f16, bool h,
                           cl_mem a, cl_mem x, cl_mem y, cl_mem bias,
                           int c_i, int w_i, int k_i, int stride, int pad_l, int dilation,
                           int has_bias) const {
@@ -272,7 +292,7 @@ class Conv : public OpenCLKernel {
       const size_t fgm = (static_cast<size_t>(m_i) + t.bm - 1) / t.bm;
       const size_t fgn = (static_cast<size_t>(wout_i) + t.bn - 1) / t.bn;
       const size_t fgn_used = std::min(fgn, std::max<size_t>(1, cap0 / flx));
-      KernelLauncher kl{GetKernel(ConvTileKernel(t, f16))};
+      KernelLauncher kl{GetKernel(ConvTileKernel(t, f16, h))};
       BindConvGemm(kl, a, x, y, bias, m_i, wout_i, c_i, w_i, k_i, stride, pad_l, dilation, has_bias);
       const double us = kl.TimeOnTuneQueue(*exec_, NDRange(fgn_used * flx, fgm * fly), NDRange(flx, fly));
       if (us < best_us) {
@@ -305,7 +325,8 @@ ONNX_OPENCL_OPERATOR_KERNEL(
     Conv,
     11,
     KernelDefBuilder()
-        .TypeConstraint("T", DataTypeImpl::GetTensorType<float>()),
+        .TypeConstraint("T", {DataTypeImpl::GetTensorType<float>(),
+                              DataTypeImpl::GetTensorType<MLFloat16>()}),
     Conv);
 
 }  // namespace opencl
