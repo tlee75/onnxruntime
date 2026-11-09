@@ -271,7 +271,7 @@ DEFINE_GEMM_TILED_CONV_F16(Gemm_Tiled_Conv_BN32_F16, 64, 32, 32, 4, 4)
 // Half-*storage* twins: same tiles and half2 accumulate, but Wt/X/Y/B are half in
 // memory -- what an fp16 graph (and the GPU delegate) actually hands us. The F16
 // family above keeps fp32 storage and converts per element on load and store.
-#define DEFINE_GEMM_TILED_CONV_H(NAME, BM, BN, BK, TM, TN)                     \
+#define DEFINE_GEMM_TILED_CONV_H(NAME, BM, BN, BK, TM, TN, NG)                  \
   __kernel __attribute__((reqd_work_group_size(BN / TN, BM / TM, 1)))           \
   void NAME(const int M, const int Wout, const int C, const int W,              \
             const int K, const int stride, const int pad, const int dil,        \
@@ -328,14 +328,21 @@ DEFINE_GEMM_TILED_CONV_F16(Gemm_Tiled_Conv_BN32_F16, 64, 32, 32, 4, 4)
           const int j = idx % BN;                                               \
           const int gk = k0 + kk;                                               \
           const int ow = col0 + j;                                              \
-          half v = (half)0;                                                       \
+          half v = (half)0;                                                     \
           if (gk < Kdim && ow < Wout) {                                         \
-            const int c = gk / K;                                               \
-            const int tap = gk - c * K;                                         \
-            const int iw = ow * stride - pad + tap * dil;                       \
-            if (iw >= 0 && iw < W) v = X[c * W + iw];                           \
+            if (NG) {                                                           \
+              /* DIAGNOSTIC (ORT_OPENCL_EXP=conv_nogather): read X CONTIGUOUSLY */ \
+              /* instead of via the strided im2col index. Wrong on purpose --    */ \
+              /* this exists only to price the gather with the paired harness.  */ \
+              v = X[(gk % C) * W + (ow % W)];                                   \
+            } else {                                                            \
+              const int c = gk / K;                                             \
+              const int tap = gk - c * K;                                       \
+              const int iw = ow * stride - pad + tap * dil;                     \
+              if (iw >= 0 && iw < W) v = X[c * W + iw];                         \
+            }                                                                   \
           }                                                                     \
-          Bs[kk][j] = v;                                                  \
+          Bs[kk][j] = v;                                                        \
         }                                                                       \
         barrier(CLK_LOCAL_MEM_FENCE);                                           \
         for (int kk = 0; kk < BK; ++kk) {                                       \
@@ -379,12 +386,15 @@ DEFINE_GEMM_TILED_CONV_F16(Gemm_Tiled_Conv_BN32_F16, 64, 32, 32, 4, 4)
   }
 
 
-DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_H, 64, 64, 32, 4, 4)
-DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_BM32_H, 32, 64, 32, 4, 4)
-DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_BM16_H, 16, 64, 32, 4, 4)
-DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_BN32_H, 64, 32, 32, 4, 4)
+DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_H, 64, 64, 32, 4, 4, 0)
+DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_BM32_H, 32, 64, 32, 4, 4, 0)
+DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_BM16_H, 16, 64, 32, 4, 4, 0)
+DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_BN32_H, 64, 32, 32, 4, 4, 0)
 // DEV-ONLY experiment: the same tile with a larger register block (TM=TN=8, so a
 // 8x8 work-group and 4x the outputs per work-item). Selected by ORT_OPENCL_EXP so
 // the bench's paired A/B can run both in one process. NOT for the upstream series.
-DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_H_TM8, 64, 64, 32, 8, 8)
+DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_H_TM8, 64, 64, 32, 8, 8, 0)
+// DIAGNOSTIC (ORT_OPENCL_EXP=conv_nogather): contiguous read, WRONG output, to
+// price the strided im2col gather. Dev-only; never for the upstream series.
+DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_H_NG, 64, 64, 32, 4, 4, 1)
 #endif
