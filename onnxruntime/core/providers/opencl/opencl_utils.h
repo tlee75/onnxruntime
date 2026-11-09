@@ -338,6 +338,18 @@ class Image2DDesc {
   }
 };
 
+/// True when the tensor holds fp16 (MLFloat16) elements.
+///
+/// Compare the ONNX ELEMENT TYPE, not `DataTypeImpl::GetTensorType<MLFloat16>()`:
+/// the DataType* a kernel is handed does not compare equal to the one this module's
+/// DataTypeImpl returns, so a pointer test silently reports "float" for an fp16
+/// tensor -- and the fp32 kernels then run on half buffers. ORT compares types by
+/// NAME for exactly this reason (`KernelTypeStrResolver`); do the same here.
+inline bool IsFp16Tensor(const Tensor& t) {
+  const auto* prim = t.DataType()->AsPrimitiveDataType();
+  return prim != nullptr && prim->GetDataType() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT16;
+}
+
 class KernelLauncher {
  public:
   explicit KernelLauncher(cl_kernel kernel) : kernel_{kernel}, index_{0}, err_{CL_SUCCESS} {}
