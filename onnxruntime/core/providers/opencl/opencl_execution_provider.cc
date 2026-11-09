@@ -386,6 +386,14 @@ Status OpenCLExecutionProvider::InitCompileOptions() {
   if (dev_info_.device_name == "Mali-G51") {
     compile_options_.append(" -D CONFORMANCE_could_not_emit_constant_value_abstractly");
   }
+  // The fp16 kernels live behind USE_FP16 in the .cl sources (elementwise, neg,
+  // greater, Elu). Compiling them needs the fp16 prelude (which enables
+  // cl_khr_fp16), so gate the define on the session actually using fp16 -- note
+  // InitOpenCLContext has already run, so this is false on a device without
+  // cl_khr_fp16.
+  if (UseFp16()) {
+    compile_options_.append(" -D USE_FP16=1");
+  }
   return Status::OK();
 }
 
