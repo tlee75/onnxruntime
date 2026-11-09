@@ -282,19 +282,89 @@ void Gemm_Tiled_F16H(
         acc2[i][j2] = (half2)(bias_r[i], bias_r[i]);
 
     for (int k0 = 0; k0 < K; k0 += GEMM_BK) {
-      for (int idx = tid; idx < GEMM_BM * GEMM_BK; idx += nthreads) {
-        const int i = trans_a ? (idx % GEMM_BM) : (idx / GEMM_BK);
-        const int kk = trans_a ? (idx / GEMM_BM) : (idx % GEMM_BK);
-        const int gr = row0 + i;
-        const int gk = k0 + kk;
-        As[i][kk] = (gr < M && gk < K) ? A[trans_a ? (gk * M + gr) : (gr * K + gk)] : (half)0;
+      // Packed half2 global loads where the addresses are structurally contiguous
+      // AND 4-byte aligned: one 4-byte access per two elements. A scalar 2-byte
+      // global access is disproportionately slow on Adreno -- this half-storage
+      // twin measured ~8% slower than the fp32-storage Gemm_Tiled_F16 despite
+      // moving half the bytes -- so pairing the elements is the point. The guards
+      // are RUNTIME, so an odd stride or an under-aligned tensor takes the scalar
+      // path with no second kernel variant (and no host-side capability query).
+      const bool a_pack = ((((size_t)A) & 3) == 0) &&
+                          ((trans_a ? (M & 1) : (K & 1)) == 0);
+      if (!trans_a) {
+        if (a_pack) {
+          for (int idx = tid; idx < GEMM_BM * (GEMM_BK / 2); idx += nthreads) {
+            const int i = idx / (GEMM_BK / 2);
+            const int kp = (idx % (GEMM_BK / 2)) * 2;
+            const int gr = row0 + i;
+            const int gk = k0 + kp;
+            if (gr < M && gk + 1 < K) {
+              const half2 v = *(__global const half2*)(A + gr * K + gk);
+              As[i][kp] = v.lo;
+              As[i][kp + 1] = v.hi;
+            } else {
+              As[i][kp] = (gr < M && gk < K) ? A[gr * K + gk] : (half)0;
+              As[i][kp + 1] = (gr < M && gk + 1 < K) ? A[gr * K + gk + 1] : (half)0;
+            }
+          }
+        } else {
+          for (int idx = tid; idx < GEMM_BM * GEMM_BK; idx += nthreads) {
+            const int i = idx / GEMM_BK;
+            const int kk = idx % GEMM_BK;
+            const int gr = row0 + i;
+            const int gk = k0 + kk;
+            As[i][kk] = (gr < M && gk < K) ? A[gr * K + gk] : (half)0;
+          }
+        }
+      } else {
+        if (a_pack) {
+          for (int idx = tid; idx < GEMM_BK * (GEMM_BM / 2); idx += nthreads) {
+            const int kk = idx / (GEMM_BM / 2);
+            const int ip = (idx % (GEMM_BM / 2)) * 2;
+            const int gr = row0 + ip;
+            const int gk = k0 + kk;
+            if (gk < K && gr + 1 < M) {
+              const half2 v = *(__global const half2*)(A + gk * M + gr);
+              As[ip][kk] = v.lo;
+              As[ip + 1][kk] = v.hi;
+            } else {
+              As[ip][kk] = (gr < M && gk < K) ? A[gk * M + gr] : (half)0;
+              As[ip + 1][kk] = (gr + 1 < M && gk < K) ? A[gk * M + gr + 1] : (half)0;
+            }
+          }
+        } else {
+          for (int idx = tid; idx < GEMM_BM * GEMM_BK; idx += nthreads) {
+            const int i = idx % GEMM_BM;
+            const int kk = idx / GEMM_BM;
+            const int gr = row0 + i;
+            const int gk = k0 + kk;
+            As[i][kk] = (gr < M && gk < K) ? A[gk * M + gr] : (half)0;
+          }
+        }
       }
-      for (int idx = tid; idx < GEMM_BK * GEMM_BN; idx += nthreads) {
-        const int kk = idx / GEMM_BN;
-        const int j = idx % GEMM_BN;
-        const int gk = k0 + kk;
-        const int gc = col0 + j;
-        Bs[kk][j] = (gk < K && gc < N) ? B[gk * N + gc] : (half)0;
+      if ((((size_t)B) & 3) == 0 && (N & 1) == 0) {
+        for (int idx = tid; idx < GEMM_BK * (GEMM_BN / 2); idx += nthreads) {
+          const int kk = idx / (GEMM_BN / 2);
+          const int jp = (idx % (GEMM_BN / 2)) * 2;
+          const int gk = k0 + kk;
+          const int gc = col0 + jp;
+          if (gk < K && gc + 1 < N) {
+            const half2 v = *(__global const half2*)(B + gk * N + gc);
+            Bs[kk][jp] = v.lo;
+            Bs[kk][jp + 1] = v.hi;
+          } else {
+            Bs[kk][jp] = (gk < K && gc < N) ? B[gk * N + gc] : (half)0;
+            Bs[kk][jp + 1] = (gk < K && gc + 1 < N) ? B[gk * N + gc + 1] : (half)0;
+          }
+        }
+      } else {
+        for (int idx = tid; idx < GEMM_BK * GEMM_BN; idx += nthreads) {
+          const int kk = idx / GEMM_BN;
+          const int j = idx % GEMM_BN;
+          const int gk = k0 + kk;
+          const int gc = col0 + j;
+          Bs[kk][j] = (gk < K && gc < N) ? B[gk * N + gc] : (half)0;
+        }
       }
       barrier(CLK_LOCAL_MEM_FENCE);
 
@@ -311,13 +381,28 @@ void Gemm_Tiled_F16H(
       barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    for (int i = 0; i < GEMM_TM; ++i) {
-      const int gr = row0 + ly * GEMM_TM + i;
-      if (gr >= M) continue;
-      for (int j2 = 0; j2 < GEMM_TN / 2; ++j2) {
-        const int gc = col0 + lx * GEMM_TN + 2 * j2;
-        if (gc < N) C[gr * N + gc] = acc2[i][j2].lo;
-        if (gc + 1 < N) C[gr * N + gc + 1] = acc2[i][j2].hi;
+    if ((((size_t)C) & 3) == 0 && (N & 1) == 0) {
+      for (int i = 0; i < GEMM_TM; ++i) {
+        const int gr = row0 + ly * GEMM_TM + i;
+        if (gr >= M) continue;
+        for (int j2 = 0; j2 < GEMM_TN / 2; ++j2) {
+          const int gc = col0 + lx * GEMM_TN + 2 * j2;
+          if (gc + 1 < N) {
+            *(__global half2*)(C + gr * N + gc) = acc2[i][j2];
+          } else if (gc < N) {
+            C[gr * N + gc] = acc2[i][j2].lo;
+          }
+        }
+      }
+    } else {
+      for (int i = 0; i < GEMM_TM; ++i) {
+        const int gr = row0 + ly * GEMM_TM + i;
+        if (gr >= M) continue;
+        for (int j2 = 0; j2 < GEMM_TN / 2; ++j2) {
+          const int gc = col0 + lx * GEMM_TN + 2 * j2;
+          if (gc < N) C[gr * N + gc] = acc2[i][j2].lo;
+          if (gc + 1 < N) C[gr * N + gc + 1] = acc2[i][j2].hi;
+        }
       }
     }
     barrier(CLK_LOCAL_MEM_FENCE);

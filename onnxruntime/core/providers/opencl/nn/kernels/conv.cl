@@ -299,12 +299,29 @@ DEFINE_GEMM_TILED_CONV_F16(Gemm_Tiled_Conv_BN32_F16, 64, 32, 32, 4, 4)
         for (int j2 = 0; j2 < TN / 2; ++j2)                                     \
           acc2[i][j2] = (half2)(bias_r[i], bias_r[i]);                          \
       for (int k0 = 0; k0 < Kdim; k0 += BK) {                                   \
-        for (int idx = tid; idx < BM * BK; idx += nthreads) {                   \
-          const int i = idx / BK;                                               \
-          const int kk = idx % BK;                                              \
-          const int gr = row0 + i;                                              \
-          const int gk = k0 + kk;                                               \
-          As[i][kk] = ((gr < M && gk < Kdim) ? Wt[gr * Kdim + gk] : (half)0);\
+        if ((((size_t)Wt) & 3) == 0 && (Kdim & 1) == 0) {                      \
+          for (int idx = tid; idx < BM * (BK / 2); idx += nthreads) {           \
+            const int i = idx / (BK / 2);                                       \
+            const int kp = (idx % (BK / 2)) * 2;                               \
+            const int gr = row0 + i;                                            \
+            const int gk = k0 + kp;                                             \
+            if (gr < M && gk + 1 < Kdim) {                                      \
+              const half2 v = *(__global const half2*)(Wt + gr * Kdim + gk);    \
+              As[i][kp] = v.lo;                                                 \
+              As[i][kp + 1] = v.hi;                                             \
+            } else {                                                            \
+              As[i][kp] = ((gr < M && gk < Kdim) ? Wt[gr * Kdim + gk] : (half)0); \
+              As[i][kp + 1] = ((gr < M && gk + 1 < Kdim) ? Wt[gr * Kdim + gk + 1] : (half)0); \
+            }                                                                   \
+          }                                                                     \
+        } else {                                                                \
+          for (int idx = tid; idx < BM * BK; idx += nthreads) {                 \
+            const int i = idx / BK;                                             \
+            const int kk = idx % BK;                                            \
+            const int gr = row0 + i;                                            \
+            const int gk = k0 + kk;                                             \
+            As[i][kk] = ((gr < M && gk < Kdim) ? Wt[gr * Kdim + gk] : (half)0); \
+          }                                                                     \
         }                                                                       \
         for (int idx = tid; idx < BK * BN; idx += nthreads) {                   \
           const int kk = idx / BN;                                              \
@@ -333,13 +350,28 @@ DEFINE_GEMM_TILED_CONV_F16(Gemm_Tiled_Conv_BN32_F16, 64, 32, 32, 4, 4)
         }                                                                       \
         barrier(CLK_LOCAL_MEM_FENCE);                                           \
       }                                                                         \
-      for (int i = 0; i < TM; ++i) {                                            \
-        const int gr = row0 + ly * TM + i;                                      \
-        if (gr >= M) continue;                                                  \
-        for (int j2 = 0; j2 < TN / 2; ++j2) {                                   \
-          const int gc = col0 + lx * TN + 2 * j2;                               \
-          if (gc < Wout) Y[gr * Wout + gc] = acc2[i][j2].lo;             \
-          if (gc + 1 < Wout) Y[gr * Wout + gc + 1] = acc2[i][j2].hi;     \
+      if ((((size_t)Y) & 3) == 0 && (Wout & 1) == 0) {                          \
+        for (int i = 0; i < TM; ++i) {                                          \
+          const int gr = row0 + ly * TM + i;                                    \
+          if (gr >= M) continue;                                                \
+          for (int j2 = 0; j2 < TN / 2; ++j2) {                                 \
+            const int gc = col0 + lx * TN + 2 * j2;                             \
+            if (gc + 1 < Wout) {                                                \
+              *(__global half2*)(Y + gr * Wout + gc) = acc2[i][j2];             \
+            } else if (gc < Wout) {                                             \
+              Y[gr * Wout + gc] = acc2[i][j2].lo;                               \
+            }                                                                   \
+          }                                                                     \
+        }                                                                       \
+      } else {                                                                  \
+        for (int i = 0; i < TM; ++i) {                                          \
+          const int gr = row0 + ly * TM + i;                                    \
+          if (gr >= M) continue;                                                \
+          for (int j2 = 0; j2 < TN / 2; ++j2) {                                 \
+            const int gc = col0 + lx * TN + 2 * j2;                             \
+            if (gc < Wout) Y[gr * Wout + gc] = acc2[i][j2].lo;             \
+            if (gc + 1 < Wout) Y[gr * Wout + gc + 1] = acc2[i][j2].hi;     \
+          }                                                                     \
         }                                                                       \
       }                                                                         \
       barrier(CLK_LOCAL_MEM_FENCE);                                             \
