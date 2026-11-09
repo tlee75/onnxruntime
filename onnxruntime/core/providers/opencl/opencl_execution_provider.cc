@@ -9,6 +9,8 @@
 #include "core/common/logging/logging.h"
 #include "core/framework/kernel_registry.h"
 #include "core/framework/op_kernel.h"
+#include "core/framework/compute_capability.h"
+#include "core/graph/graph_viewer.h"
 
 #include <algorithm>
 #include <array>
@@ -259,6 +261,56 @@ std::shared_ptr<KernelRegistry> OpenCLExecutionProvider::GetKernelRegistry() con
   static std::shared_ptr<KernelRegistry> kernel_registry = opencl::GetOpenCLKernelRegistry();
   return kernel_registry;
 }
+
+namespace {
+/// True for a NodeArg whose element type is fp16 (MLFloat16 in the graph).
+bool IsFp16Tensor(const NodeArg* arg) {
+  if (arg == nullptr || !arg->Exists()) return false;
+  const ONNX_NAMESPACE::TypeProto* type = arg->TypeAsProto();
+  return type != nullptr && type->has_tensor_type() &&
+         type->tensor_type().elem_type() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT16;
+}
+
+bool NodeUsesFp16(const Node& node) {
+  for (const NodeArg* def : node.InputDefs()) {
+    if (IsFp16Tensor(def)) return true;
+  }
+  for (const NodeArg* def : node.OutputDefs()) {
+    if (IsFp16Tensor(def)) return true;
+  }
+  return false;
+}
+}  // namespace
+
+// Registration is the capability declaration: the base implementation claims every
+// node its kernel registry resolves, and this EP has no other filter. The registry
+// is built once and is device-independent, so on a device without cl_khr_fp16 it
+// also advertises the fp16 kernels (Conv/ConvTranspose/Elu, the fp16 elementwise
+// ops) -- which cannot run there, because their `cl_khr_fp16` guards compile them
+// out. Claiming such a node fails later in GetKernel() with "Unable to find
+// kernel"; declining it lets InsertCastTransformer wrap the node in Cast-to-fp32
+// and run it on the CPU, which is the fallback every EP relies on for a dtype it
+// does not implement.
+std::vector<std::unique_ptr<ComputeCapability>>
+OpenCLExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph_viewer,
+                                       const IKernelLookup& kernel_lookup,
+                                       const GraphOptimizerRegistry& /*graph_optimizer_registry*/,
+                                       IResourceAccountant* /*resource_accountant*/) const {
+  std::vector<std::unique_ptr<ComputeCapability>> result;
+  const bool can_run_fp16 = SupportsFp16();
+  for (const auto& node : graph_viewer.Nodes()) {
+    if (kernel_lookup.LookUpKernel(node) == nullptr) {
+      continue;
+    }
+    if (!can_run_fp16 && NodeUsesFp16(node)) {
+      continue;
+    }
+    auto sub_graph = std::make_unique<IndexedSubGraph>();
+    sub_graph->nodes.push_back(node.Index());
+    result.push_back(std::make_unique<ComputeCapability>(std::move(sub_graph)));
+  }
+  return result;
+}
 template <class T>
 static void GetCLDevInfo(cl_device_id  device ,
                   cl_device_info param_name, T* param) {
@@ -383,14 +435,6 @@ Status OpenCLExecutionProvider::InitCompileOptions() {
   compile_options_.reserve(2048);
   if (dev_info_.device_name == "Mali-G51") {
     compile_options_.append(" -D CONFORMANCE_could_not_emit_constant_value_abstractly");
-  }
-  // The fp16 kernels live behind USE_FP16 in the .cl sources (elementwise, neg,
-  // greater, Elu). Compiling them needs the fp16 prelude (which enables
-  // cl_khr_fp16), so gate the define on the session actually using fp16 -- note
-  // InitOpenCLContext has already run, so this is false on a device without
-  // cl_khr_fp16.
-  if (UseFp16()) {
-    compile_options_.append(" -D USE_FP16=1");
   }
   return Status::OK();
 }

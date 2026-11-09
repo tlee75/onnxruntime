@@ -89,8 +89,9 @@ DEFINE_OP_KERNEL(long, long, mul, MUL_OP)
 DEFINE_OP_KERNEL(long, long, div, DIV_OP)
 // DEFINE_OP_KERNEL(long, long, pow, POW_OP)
 
-#ifdef USE_FP16
-#define cl_khr_fp16 1
+// fp16 kernels are a DEVICE capability (cl_khr_fp16), not a session choice:
+// an fp16 graph needs them whatever use_fp16 says.
+#if defined(cl_khr_fp16)
 DEFINE_OP_KERNEL(half, fp16, add, ADD_OP)
 DEFINE_OP_KERNEL(half, fp16, sub, SUB_OP)
 DEFINE_OP_KERNEL(half, fp16, mul, MUL_OP)
@@ -247,7 +248,9 @@ DEFINE_LOGICOP_FAST_KERNELS(long, long, greater, GREATER_OP)
 DEFINE_LOGICOP_FAST_KERNELS(long, long, equal, EQUAL_OP)
 DEFINE_LOGICOP_FAST_KERNELS(uchar, bool, equal, EQUAL_OP)
 
-#ifdef USE_FP16
+// fp16 kernels are a DEVICE capability (cl_khr_fp16), not a session choice:
+// an fp16 graph needs them whatever use_fp16 says.
+#if defined(cl_khr_fp16)
 DEFINE_OP_FAST_KERNELS(half, fp16, add, ADD_OP)
 DEFINE_OP_FAST_KERNELS(half, fp16, sub, SUB_OP)
 DEFINE_OP_FAST_KERNELS(half, fp16, mul, MUL_OP)

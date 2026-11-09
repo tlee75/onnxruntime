@@ -44,9 +44,14 @@ namespace {
 #include "opencl_generated/kernels/prelude_f32.cl.inc"
 }  // namespace
 
-std::string GetFullSource(std::string_view src_body, bool use_fp16) {
+// The fp16 kernels in the sources are guarded by `cl_khr_fp16`, and enabling that
+// extension is the only thing the prelude actually does (every macro it defines is
+// unused by the current kernels). So the prelude follows the DEVICE capability, not
+// the session's use_fp16: an fp16 graph must run whatever the flag says. The flag
+// still selects the reduced-precision kernel VARIANTS for fp32 tensors.
+std::string GetFullSource(std::string_view src_body, bool enable_fp16) {
   std::ostringstream oss;
-  if (use_fp16) {
+  if (enable_fp16) {
     oss << std::string_view{prelude_f16_src, prelude_f16_src_len} << "\n";
   } else {
     oss << std::string_view{prelude_f32_src, prelude_f32_src_len} << "\n";
@@ -108,7 +113,7 @@ inline std::array<uint32_t, 4> GetProgramKeyFromFullSource(const std::string_vie
 }
 
 cl_program OpenCLProgramManager::GetProgram(std::string_view src_body) {
-  auto full_src = GetFullSource(src_body, exec_->UseFp16());
+  auto full_src = GetFullSource(src_body, exec_->SupportsFp16());
   auto key = GetProgramKeyFromFullSource(full_src);
 
   const auto& it = program_registry_.find(key);
