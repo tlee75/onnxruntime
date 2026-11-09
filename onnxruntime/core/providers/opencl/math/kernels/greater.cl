@@ -39,8 +39,9 @@ DEFINE_GREATER_KERNEL(float, float)
 DEFINE_GREATER_KERNEL(double, double)
 #endif
 
-#ifdef USE_FP16
+// fp16 kernels are a DEVICE capability (cl_khr_fp16), not a session choice:
+// an fp16 graph needs them whatever use_fp16 says.
+#if defined(cl_khr_fp16)
 // 定义 half 类型的 greater kernel
-#define cl_khr_fp16 1
 DEFINE_GREATER_KERNEL(half, fp16)
 #endif
