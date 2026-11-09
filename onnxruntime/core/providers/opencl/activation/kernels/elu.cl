@@ -15,7 +15,7 @@ __kernel void Elu_Float(
 // half-buffer kernels (the activations are what dominate the fp16 tensor traffic).
 // Guarded by the device capability like every other fp16 kernel: `half` exists
 // once the prelude has enabled cl_khr_fp16.
-#if defined(cl_khr_fp16)
+#if defined(USE_FP16)
 __kernel void Elu_Half(
     __global const half* input,
     __global half* output,

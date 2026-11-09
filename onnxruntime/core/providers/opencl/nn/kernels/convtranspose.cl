@@ -100,7 +100,7 @@ __kernel void ConvTranspose_Col2im(
   }
 }
 
-#if defined(cl_khr_fp16)
+#if defined(USE_FP16)
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
 // Half-storage twin of the col2im gather: an fp16 graph hands us half P/Y, so the

@@ -55,7 +55,7 @@ class Conv : public OpenCLKernel {
     LoadKernel("Gemm_Tiled_Conv_BM32");
     LoadKernel("Gemm_Tiled_Conv_BM16");
     LoadKernel("Gemm_Tiled_Conv_BN32");
-    if (exec_->SupportsFp16()) {
+    if (exec_->UseFp16Kernels()) {
       LoadKernel("Gemm_Tiled_F16");
       LoadKernel("Gemm_Tiled_Conv_F16");
       LoadKernel("Gemm_Tiled_Conv_BM32_F16");

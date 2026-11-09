@@ -11,8 +11,11 @@ DEFINE_NEG_KERNEL(float, float)
 #if defined(cl_khr_fp64)
 DEFINE_NEG_KERNEL(double, double)
 #endif
-// fp16 kernels are a DEVICE capability (cl_khr_fp16), not a session choice:
-// an fp16 graph needs them whatever use_fp16 says.
-#if defined(cl_khr_fp16)
+// fp16 kernels are compiled only into programs that need them (USE_FP16 is set
+// for a session that has fp16 tensors, or when use_fp16 asks for fp16 maths).
+// They cannot simply ride along on every program: the fp16 prelude enables
+// cl_khr_fp16 for the whole program, and on Adreno that makes the *fp32*
+// kernels several times slower.
+#if defined(USE_FP16)
 DEFINE_NEG_KERNEL(half, fp16)
 #endif

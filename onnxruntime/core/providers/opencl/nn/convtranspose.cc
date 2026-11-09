@@ -48,7 +48,7 @@ class ConvTranspose : public OpenCLKernel {
     LoadKernel("ConvTranspose1D_Float");
     LoadKernel("ConvTranspose_Col2im");
     LoadKernel("Gemm_Tiled");
-    if (exec_->SupportsFp16()) {
+    if (exec_->UseFp16Kernels()) {
       LoadKernel("Gemm_Tiled_F16");
       // Half-*storage* twins for an fp16 graph (its tensors are half).
       LoadKernel("Gemm_Tiled_F16H");
