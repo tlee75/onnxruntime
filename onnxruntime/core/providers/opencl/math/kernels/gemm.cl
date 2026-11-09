@@ -79,7 +79,14 @@ void Gemm_Tiled(
     __global const float* A,
     __global const float* B,
     __global float* C,
-    __global const float* Bias) {
+    __global const float* Bias,
+    const int sa, const int sb, const int sc) {
+  // Batching (used by the Winograd paths): plane p = get_group_id(2) selects the
+  // p-th operand plane. The plain 2-D grid is plane 0 with zero offsets.
+  const int plane = get_group_id(2);
+  A += (size_t)plane * sa;
+  B += (size_t)plane * sb;
+  C += (size_t)plane * sc;
   const int lx = get_local_id(0);  // N dimension
   const int ly = get_local_id(1);  // M dimension
   const int tid = ly * get_local_size(0) + lx;
@@ -168,7 +175,12 @@ void Gemm_Tiled_F16(
     __global const float* A,
     __global const float* B,
     __global float* C,
-    __global const float* Bias) {
+    __global const float* Bias,
+    const int sa, const int sb, const int sc) {
+  const int plane = get_group_id(2);
+  A += (size_t)plane * sa;
+  B += (size_t)plane * sb;
+  C += (size_t)plane * sc;
   const int lx = get_local_id(0);
   const int ly = get_local_id(1);
   const int tid = ly * get_local_size(0) + lx;
@@ -253,7 +265,16 @@ void Gemm_Tiled_F16H(
     __global const half* A,
     __global const half* B,
     __global half* C,
-    __global const half* Bias) {
+    __global const half* Bias,
+    const int sa, const int sb, const int sc) {
+  // DEV-ONLY batching (used by the Winograd paths): plane p = get_group_id(2)
+  // selects the p-th operand plane, so ONE launch covers all six F(4,3) transform
+  // points and gets a 6x bigger grid. A 2D grid means plane 0 and zero offsets,
+  // i.e. the plain GEMM.
+  const int plane = get_group_id(2);
+  A += (size_t)plane * sa;
+  B += (size_t)plane * sb;
+  C += (size_t)plane * sc;
   const int lx = get_local_id(0);
   const int ly = get_local_id(1);
   const int tid = ly * get_local_size(0) + lx;
@@ -427,7 +448,8 @@ void Gemm_Tiled_F16H(
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
 __kernel void WinoWeightT(__global const half* Wt, const int M, const int C,
-                          const int K, const int NS, const int t, __global half* U_t) {
+                          const int K, const int NS, const int t,
+                          const int u_stride, __global half* U) {
   const int row = get_global_id(0);  // s*C + c
   const int m = get_global_id(1);
   const int NC = NS * C;
@@ -445,12 +467,12 @@ __kernel void WinoWeightT(__global const half* Wt, const int M, const int C,
   else if (t == 3) u = g0 / 24.0f + g1 / 12.0f + g2 / 6.0f;
   else if (t == 4) u = g0 / 24.0f - g1 / 12.0f + g2 / 6.0f;
   else u = g2;
-  U_t[m * NC + row] = (half)u;
+  U[t * u_stride + m * NC + row] = (half)u;
 }
 
 __kernel void WinoInputT(__global const half* X, const int C, const int W,
                          const int NS, const int pad, const int T, const int t,
-                         __global half* V_t) {
+                         const int v_stride, __global half* V) {
   const int j = get_global_id(0);
   const int row = get_global_id(1);  // s*C + c
   const int NC = NS * C;
@@ -470,14 +492,13 @@ __kernel void WinoInputT(__global const half* X, const int C, const int W,
   else if (t == 3) v = -2.0f * d[1] - d[2] + 2.0f * d[3] + d[4];
   else if (t == 4) v = 2.0f * d[1] - d[2] - 2.0f * d[3] + d[4];
   else v = 4.0f * d[1] - 5.0f * d[3] + d[5];
-  V_t[row * T + j] = (half)v;
+  V[t * v_stride + row * T + j] = (half)v;
 }
 
 // os/r place the tile in the output: os=1,r=0 for a plain Conv, and os=stride,
-// r=phase for a ConvTranspose phase (which writes every os-th element).
-__kernel void WinoOutputT(__global const half* P0, __global const half* P1,
-                          __global const half* P2, __global const half* P3,
-                          __global const half* P4, __global const half* P5,
+// r=phase for a ConvTranspose phase (which writes every os-th element). P holds
+// the six transform planes back to back, p_stride apart.
+__kernel void WinoOutputT(__global const half* P, const int p_stride,
                           const int M, const int T, const int has_bias,
                           __global const half* B, __global half* Y, const int Wout,
                           const int os, const int r) {
@@ -485,8 +506,9 @@ __kernel void WinoOutputT(__global const half* P0, __global const half* P1,
   const int m = get_global_id(1);
   if (j >= T || m >= M) return;
   const int o = m * T + j;
-  const float p0 = (float)P0[o], p1 = (float)P1[o], p2 = (float)P2[o];
-  const float p3 = (float)P3[o], p4 = (float)P4[o], p5 = (float)P5[o];
+  const float p0 = (float)P[0 * p_stride + o], p1 = (float)P[1 * p_stride + o];
+  const float p2 = (float)P[2 * p_stride + o], p3 = (float)P[3 * p_stride + o];
+  const float p4 = (float)P[4 * p_stride + o], p5 = (float)P[5 * p_stride + o];
   const float bias = has_bias ? (float)B[m] : 0.0f;
   const float y0 = p0 + p1 + p2 + p3 + p4;
   const float y1 = p1 - p2 + 2.0f * p3 - 2.0f * p4;

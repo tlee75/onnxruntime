@@ -158,6 +158,9 @@ class Conv : public OpenCLKernel {
                 .SetBuffer(x)
                 .SetBuffer(y)
                 .SetBuffer(bias)
+                .SetArg<cl_int>(0)  // sa/sb/sc: a plain (single-plane) GEMM
+                .SetArg<cl_int>(0)
+                .SetArg<cl_int>(0)
                 .Launch(*exec_, NDRange(gn_used * lx, gm * ly), NDRange(lx, ly)));
       } else {
         // General conv: fuse im2col into the GEMM.
@@ -444,8 +447,10 @@ class Conv : public OpenCLKernel {
   /// conv, as ceil(K/3) 3-tap slices stacked along the reduction (K=3 -> 1 slice,
   /// K=7 -> 3). The transformed weights U depend only on the shape, so they are
   /// built once and cached; V (input tiles) and P (transform-domain products) are
-  /// cached per (M, C, T, NS) and rebuilt each call. The six transform-domain GEMMs
-  /// reduce over NS*C instead of over C*K -- that is the win.
+  /// cached per (M, C, T, NS) and rebuilt each call. All six transform points live
+  /// in ONE U/V/P buffer (plane-stride apart) so the transform-domain GEMM is a
+  /// SINGLE 3-D launch -- its z range is the transform point -- instead of six
+  /// small ones. It reduces over NS*C instead of over C*K -- that is the win.
   Status WinogradConv(cl_mem wt, cl_mem x, cl_mem y, cl_mem bias,
                       int m_i, int wout_i, int c_i, int w_i, int k_i, int pad_l,
                       int has_bias) const {
@@ -454,26 +459,23 @@ class Conv : public OpenCLKernel {
     // GEMM then reduces over NS*C instead of over C*K.
     const int NS = (k_i + 2) / 3;
     const size_t nc = static_cast<size_t>(NS) * static_cast<size_t>(c_i);
-    const size_t u_sz = static_cast<size_t>(m_i) * nc * sizeof(cl_half);
-    const size_t v_sz = nc * static_cast<size_t>(T) * sizeof(cl_half);
-    const size_t p_sz = static_cast<size_t>(m_i) * static_cast<size_t>(T) * sizeof(cl_half);
+    const size_t u_stride = static_cast<size_t>(m_i) * nc;
+    const size_t v_stride = nc * static_cast<size_t>(T);
+    const size_t p_stride = static_cast<size_t>(m_i) * static_cast<size_t>(T);
+    const size_t u_sz = 6 * u_stride * sizeof(cl_half);
+    const size_t v_sz = 6 * v_stride * sizeof(cl_half);
+    const size_t p_sz = 6 * p_stride * sizeof(cl_half);
     std::lock_guard<std::mutex> guard(wino_mu_);
     if (wino_m_ != m_i || wino_c_ != c_i || wino_t_ != T || wino_ns_ != NS) {
-      cl_mem* sets[3] = {wino_u_, wino_v_, wino_p_};
-      for (cl_mem* arr : sets) {
-        for (int t = 0; t < 6; ++t) {
-          if (arr[t] != nullptr) clReleaseMemObject(arr[t]);
-          arr[t] = nullptr;
-        }
-      }
-      for (int t = 0; t < 6; ++t) {
-        cl_int e1 = CL_SUCCESS, e2 = CL_SUCCESS, e3 = CL_SUCCESS;
-        wino_u_[t] = clCreateBuffer(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, u_sz, nullptr, &e1);
-        wino_v_[t] = clCreateBuffer(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, v_sz, nullptr, &e2);
-        wino_p_[t] = clCreateBuffer(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, p_sz, nullptr, &e3);
-        ORT_ENFORCE(e1 == CL_SUCCESS && e2 == CL_SUCCESS && e3 == CL_SUCCESS,
-                    "WinogradConv: scratch allocation failed");
-      }
+      if (wino_u_) clReleaseMemObject(wino_u_);
+      if (wino_v_) clReleaseMemObject(wino_v_);
+      if (wino_p_) clReleaseMemObject(wino_p_);
+      cl_int e1 = CL_SUCCESS, e2 = CL_SUCCESS, e3 = CL_SUCCESS;
+      wino_u_ = clCreateBuffer(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, u_sz, nullptr, &e1);
+      wino_v_ = clCreateBuffer(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, v_sz, nullptr, &e2);
+      wino_p_ = clCreateBuffer(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, p_sz, nullptr, &e3);
+      ORT_ENFORCE(e1 == CL_SUCCESS && e2 == CL_SUCCESS && e3 == CL_SUCCESS,
+                  "WinogradConv: scratch allocation failed");
       wino_m_ = m_i;
       wino_c_ = c_i;
       wino_t_ = T;
@@ -487,7 +489,8 @@ class Conv : public OpenCLKernel {
                 .SetArg<cl_int>(k_i)
                 .SetArg<cl_int>(NS)
                 .SetArg<cl_int>(t)
-                .SetBuffer(wino_u_[t])
+                .SetArg<cl_int>(static_cast<cl_int>(u_stride))
+                .SetBuffer(wino_u_)
                 .Launch(*exec_, NDRange(nc, static_cast<size_t>(m_i))));
       }
     }
@@ -501,7 +504,8 @@ class Conv : public OpenCLKernel {
               .SetArg<cl_int>(pad_l)
               .SetArg<cl_int>(T)
               .SetArg<cl_int>(t)
-              .SetBuffer(wino_v_[t])
+              .SetArg<cl_int>(static_cast<cl_int>(v_stride))
+              .SetBuffer(wino_v_)
               .Launch(*exec_, NDRange(static_cast<size_t>(T), nc)));
     }
     const size_t lx = 16;  // Gemm_Tiled_F16H work-group: GEMM_BN / GEMM_TN
@@ -510,28 +514,25 @@ class Conv : public OpenCLKernel {
     const size_t gm = (static_cast<size_t>(m_i) + 63) / 64;
     const size_t cap0 = exec_->MaxWorkItemSize(0);
     const size_t gn_used = std::min(gn, std::max<size_t>(1, cap0 / lx));
-    for (int t = 0; t < 6; ++t) {
-      ORT_RETURN_IF_ERROR(
-          KernelLauncher{GetKernel("Gemm_Tiled_F16H")}
-              .SetArg<cl_int>(m_i)
-              .SetArg<cl_int>(T)
-              .SetArg<cl_int>(static_cast<cl_int>(nc))
-              .SetArg<cl_int>(0)  // bias is applied by WinoOutputT
-              .SetArg<cl_int>(0)  // trans_a: U is [M, C]
-              .SetBuffer(wino_u_[t])
-              .SetBuffer(wino_v_[t])
-              .SetBuffer(wino_p_[t])
-              .SetBuffer(bias)
-              .Launch(*exec_, NDRange(gn_used * lx, gm * ly), NDRange(lx, ly)));
-    }
+    ORT_RETURN_IF_ERROR(
+        KernelLauncher{GetKernel("Gemm_Tiled_F16H")}
+            .SetArg<cl_int>(m_i)
+            .SetArg<cl_int>(T)
+            .SetArg<cl_int>(static_cast<cl_int>(nc))
+            .SetArg<cl_int>(0)  // bias is applied by WinoOutputT
+            .SetArg<cl_int>(0)  // trans_a: U is [M, NC]
+            .SetBuffer(wino_u_)
+            .SetBuffer(wino_v_)
+            .SetBuffer(wino_p_)
+            .SetBuffer(bias)
+            .SetArg<cl_int>(static_cast<cl_int>(u_stride))
+            .SetArg<cl_int>(static_cast<cl_int>(v_stride))
+            .SetArg<cl_int>(static_cast<cl_int>(p_stride))
+            .Launch(*exec_, NDRange(gn_used * lx, gm * ly, 6), NDRange(lx, ly, 1)));
     ORT_RETURN_IF_ERROR(
         KernelLauncher{GetKernel("WinoOutputT")}
-            .SetBuffer(wino_p_[0])
-            .SetBuffer(wino_p_[1])
-            .SetBuffer(wino_p_[2])
-            .SetBuffer(wino_p_[3])
-            .SetBuffer(wino_p_[4])
-            .SetBuffer(wino_p_[5])
+            .SetBuffer(wino_p_)
+            .SetArg<cl_int>(static_cast<cl_int>(p_stride))
             .SetArg<cl_int>(m_i)
             .SetArg<cl_int>(T)
             .SetArg<cl_int>(has_bias)
@@ -544,12 +545,12 @@ class Conv : public OpenCLKernel {
     return Status::OK();
   }
 
-  // DEV-ONLY (ORT_OPENCL_EXP=winograd): cached transform-domain tensors, one plane
-  // per transform point. Never released (process-lifetime; dev only).
+  // DEV-ONLY (ORT_OPENCL_EXP=winograd): cached transform-domain tensors, six
+  // planes back to back per buffer. Never released (process-lifetime; dev only).
   mutable std::mutex wino_mu_;
-  mutable cl_mem wino_u_[6] = {};
-  mutable cl_mem wino_v_[6] = {};
-  mutable cl_mem wino_p_[6] = {};
+  mutable cl_mem wino_u_ = nullptr;
+  mutable cl_mem wino_v_ = nullptr;
+  mutable cl_mem wino_p_ = nullptr;
   mutable int wino_m_ = 0;
   mutable int wino_c_ = 0;
   mutable int wino_t_ = 0;

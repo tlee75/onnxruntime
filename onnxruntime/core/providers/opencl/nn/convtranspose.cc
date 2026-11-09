@@ -156,6 +156,9 @@ class ConvTranspose : public OpenCLKernel {
               .SetBuffer(x)
               .SetBuffer(p)
               .SetBuffer(bias)
+              .SetArg<cl_int>(0)  // sa/sb/sc: a plain (single-plane) GEMM
+              .SetArg<cl_int>(0)
+              .SetArg<cl_int>(0)
               .Launch(*exec_, NDRange(gn_used * lx, gm * ly), NDRange(lx, ly)));
 
       // Y[m, ow] = B[m] + sum_k P[m*K + k, (ow + pad - k*dil)/stride]
@@ -210,10 +213,10 @@ class ConvTranspose : public OpenCLKernel {
   std::vector<int64_t> output_padding_;
 
   // DEV-ONLY (ORT_OPENCL_EXP=winoct): per-phase transform-domain tensors, cached
-  // per shape. Never released (process-lifetime; dev only).
+  // per shape. Six transform planes back to back per buffer, so each phase's
+  // transform-domain GEMM is ONE 3-D launch. Never released (dev only).
   mutable std::mutex ct_mu_;
-  mutable std::vector<std::array<cl_mem, 6>> ct_u_, ct_v_, ct_p_;
-  mutable std::vector<cl_mem> ct_wp_;
+  mutable std::vector<cl_mem> ct_u_, ct_v_, ct_p_, ct_wp_;
   mutable std::vector<long> ct_key_;
 
   /// DEV-ONLY (ORT_OPENCL_EXP=winoct): the ConvTranspose phase path (see Compute).
@@ -221,9 +224,9 @@ class ConvTranspose : public OpenCLKernel {
                           int m_i, int wout_i, int c_i, int w_i, int k_i,
                           int os, int pad_l) const {
     if (static_cast<int>(ct_key_.size()) < os) {
-      ct_u_.resize(os);
-      ct_v_.resize(os);
-      ct_p_.resize(os);
+      ct_u_.resize(os, nullptr);
+      ct_v_.resize(os, nullptr);
+      ct_p_.resize(os, nullptr);
       ct_wp_.resize(os, nullptr);
       ct_key_.resize(os, 0);
     }
@@ -240,18 +243,14 @@ class ConvTranspose : public OpenCLKernel {
       const size_t mt = static_cast<size_t>(m_i) * static_cast<size_t>(T);
       const long key = static_cast<long>(m_i) * 1000000007L + static_cast<long>(c_i) * 100003L + T;
       if (ct_key_[r] != key) {
-        for (int t = 0; t < 6; ++t) {
-          if (ct_u_[r][t]) clReleaseMemObject(ct_u_[r][t]);
-          if (ct_v_[r][t]) clReleaseMemObject(ct_v_[r][t]);
-          if (ct_p_[r][t]) clReleaseMemObject(ct_p_[r][t]);
-          cl_int e = CL_SUCCESS;
-          ct_u_[r][t] = clCreateBuffer(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, mc * 3 * sizeof(cl_half), nullptr, &e);
-          ct_v_[r][t] = clCreateBuffer(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, ct * sizeof(cl_half), nullptr, &e);
-          ct_p_[r][t] = clCreateBuffer(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, mt * sizeof(cl_half), nullptr, &e);
-          ORT_ENFORCE(e == CL_SUCCESS, "WinogradCtPhases: scratch allocation failed");
-        }
+        if (ct_u_[r]) clReleaseMemObject(ct_u_[r]);
+        if (ct_v_[r]) clReleaseMemObject(ct_v_[r]);
+        if (ct_p_[r]) clReleaseMemObject(ct_p_[r]);
         if (ct_wp_[r]) clReleaseMemObject(ct_wp_[r]);
         cl_int e = CL_SUCCESS;
+        ct_u_[r] = clCreateBuffer(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, 6 * mc * 3 * sizeof(cl_half), nullptr, &e);
+        ct_v_[r] = clCreateBuffer(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, 6 * ct * sizeof(cl_half), nullptr, &e);
+        ct_p_[r] = clCreateBuffer(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, 6 * mt * sizeof(cl_half), nullptr, &e);
         ct_wp_[r] = clCreateBuffer(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, mc * 3 * sizeof(cl_half), nullptr, &e);
         ORT_ENFORCE(e == CL_SUCCESS, "WinogradCtPhases: scratch allocation failed");
         // This phase's two taps -> Wp[M][C][3]; U depends only on Wp, so both are
@@ -275,7 +274,8 @@ class ConvTranspose : public OpenCLKernel {
                   .SetArg<cl_int>(3)  // K
                   .SetArg<cl_int>(1)  // NS
                   .SetArg<cl_int>(t)
-                  .SetBuffer(ct_u_[r][t])
+                  .SetArg<cl_int>(static_cast<cl_int>(mc))
+                  .SetBuffer(ct_u_[r])
                   .Launch(*exec_, NDRange(static_cast<size_t>(c_i), static_cast<size_t>(m_i))));
         }
         ct_key_[r] = key;
@@ -290,7 +290,8 @@ class ConvTranspose : public OpenCLKernel {
                 .SetArg<cl_int>(pad3)
                 .SetArg<cl_int>(T)
                 .SetArg<cl_int>(t)
-                .SetBuffer(ct_v_[r][t])
+                .SetArg<cl_int>(static_cast<cl_int>(ct))
+                .SetBuffer(ct_v_[r])
                 .Launch(*exec_, NDRange(static_cast<size_t>(T), static_cast<size_t>(c_i))));
       }
       const size_t lx = 16;  // Gemm_Tiled_F16H work-group: GEMM_BN / GEMM_TN
@@ -299,28 +300,25 @@ class ConvTranspose : public OpenCLKernel {
       const size_t gm = (static_cast<size_t>(m_i) + 63) / 64;
       const size_t cap0 = exec_->MaxWorkItemSize(0);
       const size_t gn_used = std::min(gn, std::max<size_t>(1, cap0 / lx));
-      for (int t = 0; t < 6; ++t) {
-        ORT_RETURN_IF_ERROR(
-            KernelLauncher{GetKernel("Gemm_Tiled_F16H")}
-                .SetArg<cl_int>(m_i)
-                .SetArg<cl_int>(T)
-                .SetArg<cl_int>(c_i)
-                .SetArg<cl_int>(0)  // bias is applied by WinoOutputT
-                .SetArg<cl_int>(0)  // trans_a: U is [M, C]
-                .SetBuffer(ct_u_[r][t])
-                .SetBuffer(ct_v_[r][t])
-                .SetBuffer(ct_p_[r][t])
-                .SetBuffer(bias)
-                .Launch(*exec_, NDRange(gn_used * lx, gm * ly), NDRange(lx, ly)));
-      }
+      ORT_RETURN_IF_ERROR(
+          KernelLauncher{GetKernel("Gemm_Tiled_F16H")}
+              .SetArg<cl_int>(m_i)
+              .SetArg<cl_int>(T)
+              .SetArg<cl_int>(c_i)
+              .SetArg<cl_int>(0)  // bias is applied by WinoOutputT
+              .SetArg<cl_int>(0)  // trans_a: U is [M, C]
+              .SetBuffer(ct_u_[r])
+              .SetBuffer(ct_v_[r])
+              .SetBuffer(ct_p_[r])
+              .SetBuffer(bias)
+              .SetArg<cl_int>(static_cast<cl_int>(mc))
+              .SetArg<cl_int>(static_cast<cl_int>(ct))
+              .SetArg<cl_int>(static_cast<cl_int>(mt))
+              .Launch(*exec_, NDRange(gn_used * lx, gm * ly, 6), NDRange(lx, ly, 1)));
       ORT_RETURN_IF_ERROR(
           KernelLauncher{GetKernel("WinoOutputT")}
-              .SetBuffer(ct_p_[r][0])
-              .SetBuffer(ct_p_[r][1])
-              .SetBuffer(ct_p_[r][2])
-              .SetBuffer(ct_p_[r][3])
-              .SetBuffer(ct_p_[r][4])
-              .SetBuffer(ct_p_[r][5])
+              .SetBuffer(ct_p_[r])
+              .SetArg<cl_int>(static_cast<cl_int>(mt))
               .SetArg<cl_int>(m_i)
               .SetArg<cl_int>(T)
               .SetArg<cl_int>(has_bias)
