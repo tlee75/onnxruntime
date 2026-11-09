@@ -6,6 +6,7 @@
 #include "opencl_data_transfer.h"
 
 #include <chrono>
+#include <cstring>
 
 #include "core/framework/ortdevice.h"
 #include "core/framework/tensor.h"
@@ -54,7 +55,17 @@ Status OpenCLGPUDataTransfer::CopyTensor(const Tensor& src, Tensor& dst) const {
     if (src_device.MemType() == OrtDevice::MemType::DEFAULT) {
       VLOGF_DEFAULT(V_COPY, "Copy  Buffer(%p) -----> host(%p)", CL_BUFFER_FROM_TENSOR(src), dst.DataRaw());
       const auto _t0 = std::chrono::steady_clock::now();
-      ORT_RETURN_IF_CL_ERROR(clEnqueueReadBuffer(exec_->GetCommandQueue(), CL_BUFFER_FROM_TENSOR(src), /*blocking_read=*/CL_TRUE, /*offset=*/0, dst.SizeInBytes(), dst.MutableDataRaw(), 0, nullptr, nullptr));
+      // Stage through a host-visible buffer: a GPU-side copy into pinned memory,
+      // then a blocking map (zero-copy for CL_MEM_ALLOC_HOST_PTR) and a memcpy out.
+      // Reading a device-local buffer straight into host memory is what costs
+      // hundreds of milliseconds on Adreno (see GetStagingBuffer).
+      cl_mem staging = exec_->GetStagingBuffer(dst.SizeInBytes());
+      ORT_RETURN_IF_CL_ERROR(clEnqueueCopyBuffer(exec_->GetCommandQueue(), CL_BUFFER_FROM_TENSOR(src), staging, /*src_offset=*/0, /*dst_offset=*/0, dst.SizeInBytes(), 0, nullptr, nullptr));
+      cl_int map_err = CL_SUCCESS;
+      void* mapped = clEnqueueMapBuffer(exec_->GetCommandQueue(), staging, /*blocking_map=*/CL_TRUE, CL_MAP_READ, /*offset=*/0, dst.SizeInBytes(), 0, nullptr, nullptr, &map_err);
+      ORT_RETURN_IF_CL_ERROR(map_err);
+      std::memcpy(dst.MutableDataRaw(), mapped, dst.SizeInBytes());
+      ORT_RETURN_IF_CL_ERROR(clEnqueueUnmapMemObject(exec_->GetCommandQueue(), staging, mapped, 0, nullptr, nullptr));
       if (exec_->TuneEnabledLevel()) {
         exec_->ProfHostAdd("d2h_read", static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                       std::chrono::steady_clock::now() - _t0).count()), dst.SizeInBytes());

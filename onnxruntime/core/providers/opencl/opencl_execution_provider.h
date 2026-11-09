@@ -151,6 +151,14 @@ class OpenCLExecutionProvider : public IExecutionProvider {
   void ProfHostAdd(const char* name, uint64_t ns, uint64_t bytes) const;
   void ProfDump() const;
 
+  /// Host-visible (CL_MEM_ALLOC_HOST_PTR) staging buffer of at least `nbytes`,
+  /// cached per size and owned by the EP. The device->host copy path stages through
+  /// it: a blocking read straight from a device-local buffer is pathologically slow
+  /// on some drivers (Adreno measured ~7 MB/s vs ~1.6 GB/s for the equivalent
+  /// write, because the driver stages and cache-cleans per line), while a GPU-side
+  /// clEnqueueCopyBuffer into pinned memory plus a map is near-bandwidth.
+  cl_mem GetStagingBuffer(size_t nbytes) const;
+
   const std::string GetCompileOptions() const { return compile_options_; };
 
   /// OpenCLKernel use it to initialize OpenCLKernelHolder
@@ -188,6 +196,9 @@ class OpenCLExecutionProvider : public IExecutionProvider {
   // scratch buffer is handed back out instead of churning the allocator.
   mutable std::unordered_map<cl_mem, size_t> scratch_size_;
   mutable std::unordered_map<size_t, std::vector<cl_mem>> scratch_pool_;
+
+  // Staging buffers for the device->host copy path (see GetStagingBuffer).
+  mutable std::unordered_map<size_t, cl_mem> staging_pool_;
 
   // Per-kernel GPU timing (see ProfRecord/ProfDump). Empty unless the tune switch
   // armed the profiler, so a shipped run never allocates an event.

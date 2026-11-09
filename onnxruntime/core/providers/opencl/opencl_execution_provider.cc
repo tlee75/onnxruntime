@@ -243,6 +243,9 @@ OpenCLExecutionProvider::~OpenCLExecutionProvider() {
   for (auto& kv : scratch_size_) {
     if (kv.first) clReleaseMemObject(kv.first);
   }
+  for (auto& kv : staging_pool_) {
+    if (kv.second) clReleaseMemObject(kv.second);
+  }
 
 #ifdef TRACY_ENABLE
   TracyCLCollect(tracy_cl_ctx_);
@@ -546,6 +549,18 @@ constexpr const char* kFrameMarkName = "OpenCL EP Run";
 
 //   return Status::OK();
 // }
+
+cl_mem OpenCLExecutionProvider::GetStagingBuffer(size_t nbytes) const {
+  std::lock_guard<std::mutex> g(aux_mu_);
+  auto it = staging_pool_.find(nbytes);
+  if (it != staging_pool_.end()) return it->second;
+  int err = 0;
+  cl_mem buf = clCreateBuffer(this->GetOpenCLContext(),
+                              CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, nbytes, nullptr, &err);
+  ORT_THROW_IF_CL_ERROR(err);
+  staging_pool_[nbytes] = buf;
+  return buf;
+}
 
 cl_mem OpenCLExecutionProvider::GetScratchBufferTmp(size_t nbytes) const {
 
