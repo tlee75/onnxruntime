@@ -83,6 +83,10 @@ Status RegisterOpenCLKernels(KernelRegistry& kernel_registry) {
                                                                 Add)>,
       BuildKernelCreateInfo<ONNX_OPERATOR_TYPED_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 14, int32_t,
                                                                 Add)>,
+      // fp16 twins (mlfloat16): an fp16 graph hands us half tensors; listed here
+      // or the registration is dead code the linker removes.
+      BuildKernelCreateInfo<ONNX_OPERATOR_TYPED_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 14, MLFloat16,
+                                                                Add)>,
 
       BuildKernelCreateInfo<ONNX_OPERATOR_TYPED_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 14, float,
                                                                 Mul)>,
@@ -92,6 +96,10 @@ Status RegisterOpenCLKernels(KernelRegistry& kernel_registry) {
                                                                 Mul)>,
       BuildKernelCreateInfo<ONNX_OPERATOR_TYPED_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 14, int32_t,
                                                                 Mul)>,
+      // fp16 twins (mlfloat16): an fp16 graph hands us half tensors; listed here
+      // or the registration is dead code the linker removes.
+      BuildKernelCreateInfo<ONNX_OPERATOR_TYPED_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 14, MLFloat16,
+                                                                Mul)>,
 
       BuildKernelCreateInfo<ONNX_OPERATOR_TYPED_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 14, float,
                                                                 Sub)>,
@@ -101,6 +109,10 @@ Status RegisterOpenCLKernels(KernelRegistry& kernel_registry) {
                                                                 Sub)>,
       BuildKernelCreateInfo<ONNX_OPERATOR_TYPED_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 14, int32_t,
                                                                 Sub)>,
+      // fp16 twins (mlfloat16): an fp16 graph hands us half tensors; listed here
+      // or the registration is dead code the linker removes.
+      BuildKernelCreateInfo<ONNX_OPERATOR_TYPED_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 14, MLFloat16,
+                                                                Sub)>,
 
       BuildKernelCreateInfo<ONNX_OPERATOR_TYPED_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 14, float,
                                                                 Div)>,
@@ -109,9 +121,16 @@ Status RegisterOpenCLKernels(KernelRegistry& kernel_registry) {
       BuildKernelCreateInfo<ONNX_OPERATOR_TYPED_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 14, int64_t,
                                                                 Div)>,
       BuildKernelCreateInfo<ONNX_OPERATOR_TYPED_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 14, int32_t,
+                                                                Div)>,
+      // fp16 twins (mlfloat16): an fp16 graph hands us half tensors; listed here
+      // or the registration is dead code the linker removes.
+      BuildKernelCreateInfo<ONNX_OPERATOR_TYPED_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 14, MLFloat16,
                                                                 Div)>,
 
       BuildKernelCreateInfo<ONNX_OPERATOR_VERSIONED_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 13, 14, Pow)>,
+      // fp16 twins (mlfloat16): an fp16 graph hands us half tensors; listed here
+      // or the registration is dead code the linker removes.
+      BuildKernelCreateInfo<ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 13, 14, MLFloat16, Pow)>,
       BuildKernelCreateInfo<ONNX_OPERATOR_TYPED_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 13, float,
                                                                 Greater)>,
       BuildKernelCreateInfo<ONNX_OPERATOR_TYPED_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 13, double,
