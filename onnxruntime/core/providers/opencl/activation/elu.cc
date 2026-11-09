@@ -24,7 +24,7 @@ class Elu : public OpenCLKernel {
     info.GetAttrOrDefault<float>("alpha", &alpha_, 1.0f);
     LoadProgram(elu_kernel_src, elu_kernel_src_len);
     LoadKernel("Elu_Float");
-    if (exec_->UseFp16Kernels()) LoadKernel("Elu_Half");
+    if (exec_->SupportsFp16()) LoadKernel("Elu_Half");
   }
 
   Status Compute(OpKernelContext* context) const override {

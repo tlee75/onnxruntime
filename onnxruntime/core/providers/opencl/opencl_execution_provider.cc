@@ -322,18 +322,6 @@ OpenCLExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph_vie
                                        IResourceAccountant* /*resource_accountant*/) const {
   std::vector<std::unique_ptr<ComputeCapability>> result;
   const bool can_run_fp16 = SupportsFp16();
-  // This walk is also where the session learns whether it needs the fp16 kernels at
-  // all (see UseFp16Kernels). A program that carries them is built with the fp16
-  // prelude; one that does not must not be, because enabling cl_khr_fp16 for a whole
-  // program makes Adreno's fp32 codegen several times slower.
-  if (can_run_fp16) {
-    for (const auto& node : graph_viewer.Nodes()) {
-      if (NodeUsesFp16(node)) {
-        need_fp16_kernels_ = true;
-        break;
-      }
-    }
-  }
   for (const auto& node : graph_viewer.Nodes()) {
     if (kernel_lookup.LookUpKernel(node) == nullptr) {
       continue;

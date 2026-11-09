@@ -180,7 +180,7 @@ DEFINE_GEMM_TILED_CONV(Gemm_Tiled_Conv_BM16, 16, 64, 32, 4, 4)
 // narrow conv GEMMs (small Wout), where BN=64 leaves the grid under-filled.
 DEFINE_GEMM_TILED_CONV(Gemm_Tiled_Conv_BN32, 64, 32, 32, 4, 4)
 
-#if defined(USE_FP16)
+#if defined(cl_khr_fp16)
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
 // fp16 twin of DEFINE_GEMM_TILED_CONV: half local tiles (=> half the local

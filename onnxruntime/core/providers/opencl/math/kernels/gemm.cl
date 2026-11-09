@@ -152,7 +152,7 @@ void Gemm_Tiled(
   }
 }
 
-#if defined(USE_FP16)
+#if defined(cl_khr_fp16)
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
 // fp16 variant: half local tiles, packed half2 MAC and half2 accumulate. The

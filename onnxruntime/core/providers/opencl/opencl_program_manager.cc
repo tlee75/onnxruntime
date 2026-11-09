@@ -44,12 +44,11 @@ namespace {
 #include "opencl_generated/kernels/prelude_f32.cl.inc"
 }  // namespace
 
-// The fp16 prelude is what enables cl_khr_fp16 (every macro it defines is unused by
-// the current kernels), so it has to match the kernel set: a program that carries the
-// fp16 kernels needs it, and a strictly-fp32 program must NOT have it -- enabling the
-// extension for a whole program costs several times on Adreno's fp32 codegen.
-// `UseFp16Kernels()` is "this session has fp16 tensors, or use_fp16 asked for fp16
-// maths"; the sources guard the fp16 kernels with the matching USE_FP16 define.
+// The fp16 kernels in the sources are guarded by `cl_khr_fp16`, and enabling that
+// extension is the only thing the prelude actually does (every macro it defines is
+// unused by the current kernels). So the prelude follows the DEVICE capability, not
+// the session's use_fp16: an fp16 graph must run whatever the flag says. The flag
+// still selects the reduced-precision kernel VARIANTS for fp32 tensors.
 std::string GetFullSource(std::string_view src_body, bool enable_fp16) {
   std::ostringstream oss;
   if (enable_fp16) {
@@ -114,7 +113,7 @@ inline std::array<uint32_t, 4> GetProgramKeyFromFullSource(const std::string_vie
 }
 
 cl_program OpenCLProgramManager::GetProgram(std::string_view src_body) {
-  auto full_src = GetFullSource(src_body, exec_->UseFp16Kernels());
+  auto full_src = GetFullSource(src_body, exec_->SupportsFp16());
   auto key = GetProgramKeyFromFullSource(full_src);
 
   const auto& it = program_registry_.find(key);

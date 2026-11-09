@@ -117,13 +117,6 @@ class OpenCLExecutionProvider : public IExecutionProvider {
   /// True when the device advertises cl_khr_fp16 (so the *_F16 kernels exist).
   bool SupportsFp16() const { return dev_info_.has_fp16; }
 
-  /// True when this SESSION needs the fp16 kernels: either use_fp16 asked for fp16
-  /// maths on fp32 tensors, or the graph it is partitioning has fp16 tensors (set by
-  /// GetCapability). This -- not the device -- decides whether a program is built with
-  /// the fp16 prelude and the USE_FP16 kernel blocks, because compiling the fp32
-  /// kernels into a program that enables cl_khr_fp16 makes them much slower on Adreno.
-  bool UseFp16Kernels() const { return UseFp16() || need_fp16_kernels_; }
-
   /// CL_DEVICE_MAX_WORK_ITEM_SIZES[dim] — the per-dimension cap on the GLOBAL
   /// work size. A kernel whose grid exceeds it must grid-stride: Mali tolerates
   /// huge per-dimension sizes, but Adreno (smaller cap) can reject or schedule
@@ -170,11 +163,7 @@ class OpenCLExecutionProvider : public IExecutionProvider {
   void ProfHostAdd(const char* name, uint64_t ns, uint64_t bytes) const;
   void ProfDump() const;
 
-  /// Kernel build options. The fp16 define is added lazily: whether this session has
-  /// fp16 tensors is known only after the graph has been partitioned.
-  const std::string GetCompileOptions() const {
-    return UseFp16Kernels() ? compile_options_ + " -D USE_FP16=1" : compile_options_;
-  }
+  const std::string GetCompileOptions() const { return compile_options_; };
 
   /// OpenCLKernel use it to initialize OpenCLKernelHolder
   const opencl::OpenCLProgramManager& GetProgramManager() const;
@@ -193,8 +182,6 @@ class OpenCLExecutionProvider : public IExecutionProvider {
   cl_command_queue cmd_tune_queue_;
   int32_t auto_runing_level_;
   bool use_fp16_;
-  /// Set by GetCapability when it claims an fp16 node (GetCapability is const).
-  mutable bool need_fp16_kernels_ = false;
   bool flush_after_launch_;
   std::string compile_options_;
   opencl::OpenCLDeviceInfo dev_info_;
