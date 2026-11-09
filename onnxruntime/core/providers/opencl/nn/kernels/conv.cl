@@ -520,4 +520,73 @@ __kernel void ImgFillX(__global const half* X, const int C, const int W,
   if (iw + 3 < W) v.w = X[c * W + iw + 3];
   write_imageh(Dst, (int2)(x, c), v);
 }
+
+// DEV-ONLY (ORT_OPENCL_EXP=winograd): 1D Winograd F(4,3) for the 3-tap stride-1
+// convs. Transforms run in fp32 internally (F(4,3)'s matrices carry 1/6 and 1/24
+// constants); only the transform-domain tensors are stored half.
+//
+//   U[t][m][c] = sum_r G[t][r] * W[m][c*3 + r]        (weights, computed once)
+//   V[t][c][j] = sum_r Bt[t][r] * X[c][4j - pad + r]  (input tiles, pad_l == 2)
+//   P[t]       = U[t] @ V[t]                          (Gemm_Tiled_F16H, K = C)
+//   Y[m][4j+q] = bias[m] + sum_t At[q][t] * P[t][m][j]
+__kernel void WinoWeightT(__global const half* Wt, const int M, const int C,
+                          const int t, __global half* U_t) {
+  const int m = get_global_id(1);
+  const int c = get_global_id(0);
+  if (m >= M || c >= C) return;
+  const int b = m * (C * 3) + c * 3;
+  const float g0 = (float)Wt[b], g1 = (float)Wt[b + 1], g2 = (float)Wt[b + 2];
+  float u;
+  if (t == 0) u = 0.25f * g0;
+  else if (t == 1) u = -(g0 + g1 + g2) / 6.0f;
+  else if (t == 2) u = (-g0 + g1 - g2) / 6.0f;
+  else if (t == 3) u = g0 / 24.0f + g1 / 12.0f + g2 / 6.0f;
+  else if (t == 4) u = g0 / 24.0f - g1 / 12.0f + g2 / 6.0f;
+  else u = g2;
+  U_t[m * C + c] = (half)u;
+}
+
+__kernel void WinoInputT(__global const half* X, const int C, const int W,
+                         const int pad, const int T, const int t, __global half* V_t) {
+  const int j = get_global_id(0);
+  const int c = get_global_id(1);
+  if (j >= T || c >= C) return;
+  const int base = 4 * j - pad;
+  float d[6];
+  for (int r = 0; r < 6; ++r) {
+    const int iw = base + r;
+    d[r] = (iw >= 0 && iw < W) ? (float)X[c * W + iw] : 0.0f;
+  }
+  float v;
+  if (t == 0) v = 4.0f * d[0] - 5.0f * d[2] + d[4];
+  else if (t == 1) v = -4.0f * d[1] - 4.0f * d[2] + d[3] + d[4];
+  else if (t == 2) v = 4.0f * d[1] - 4.0f * d[2] - d[3] + d[4];
+  else if (t == 3) v = -2.0f * d[1] - d[2] + 2.0f * d[3] + d[4];
+  else if (t == 4) v = 2.0f * d[1] - d[2] - 2.0f * d[3] + d[4];
+  else v = 4.0f * d[1] - 5.0f * d[3] + d[5];
+  V_t[c * T + j] = (half)v;
+}
+
+__kernel void WinoOutputT(__global const half* P0, __global const half* P1,
+                          __global const half* P2, __global const half* P3,
+                          __global const half* P4, __global const half* P5,
+                          const int M, const int T, const int has_bias,
+                          __global const half* B, __global half* Y, const int Wout) {
+  const int j = get_global_id(0);
+  const int m = get_global_id(1);
+  if (j >= T || m >= M) return;
+  const int o = m * T + j;
+  const float p0 = (float)P0[o], p1 = (float)P1[o], p2 = (float)P2[o];
+  const float p3 = (float)P3[o], p4 = (float)P4[o], p5 = (float)P5[o];
+  const float bias = has_bias ? (float)B[m] : 0.0f;
+  const float y0 = p0 + p1 + p2 + p3 + p4;
+  const float y1 = p1 - p2 + 2.0f * p3 - 2.0f * p4;
+  const float y2 = p1 + p2 + 4.0f * p3 + 4.0f * p4;
+  const float y3 = p1 - p2 + 8.0f * p3 - 8.0f * p4 + p5;
+  const int ow = 4 * j;
+  if (ow < Wout) Y[m * Wout + ow] = (half)(y0 + bias);
+  if (ow + 1 < Wout) Y[m * Wout + ow + 1] = (half)(y1 + bias);
+  if (ow + 2 < Wout) Y[m * Wout + ow + 2] = (half)(y2 + bias);
+  if (ow + 3 < Wout) Y[m * Wout + ow + 3] = (half)(y3 + bias);
+}
 #endif

@@ -73,6 +73,10 @@ class Conv : public OpenCLKernel {
       LoadKernel("Gemm_Tiled_Conv_H_PB");
       LoadKernel("Gemm_Tiled_Conv_H_IMG");
       LoadKernel("ImgFillX");
+      // DEV-ONLY (ORT_OPENCL_EXP=winograd): see WinogradConv().
+      LoadKernel("WinoWeightT");
+      LoadKernel("WinoInputT");
+      LoadKernel("WinoOutputT");
     }
   }
 
@@ -199,6 +203,13 @@ class Conv : public OpenCLKernel {
             return Status::OK();
           }
           LOGS_DEFAULT(WARNING) << "[CL] image2d path unavailable; using buffers";
+        }
+        // DEV-ONLY (ORT_OPENCL_EXP=winograd): 1D Winograd F(4,3) for the 3-tap
+        // stride-1 convs (the graph's 3x3 Convs have pads=[2,0], i.e. pad_l == 2).
+        if (h && exec_->Exp() == "winograd" && k_i == 3 && stride == 1 && dilation == 1 &&
+            pad_l == 2 && (wout_i % 4) == 0 && m_i > 0 && c_i > 0) {
+          ORT_RETURN_IF_ERROR(WinogradConv(a, x, y, bias, m_i, wout_i, c_i, w_i, has_bias));
+          return Status::OK();
         }
         // DEV-ONLY A/B variants selected by ORT_OPENCL_EXP; both are half-storage and
         // use the same 64x64 tile/work-group, so only the kernel differs:
@@ -425,6 +436,108 @@ class Conv : public OpenCLKernel {
     }
     return img_;
   }
+
+  /// DEV-ONLY (ORT_OPENCL_EXP=winograd): the 1D F(4,3) path for a 3-tap stride-1
+  /// conv with pad_l == 2. The transformed weights U depend only on the shape, so
+  /// they are built once and cached; V (input tiles) and P (transform-domain
+  /// products) are cached per (M, C, T) and rebuilt each call. The six
+  /// transform-domain GEMMs reduce over C instead of C*3 -- that is the win.
+  Status WinogradConv(cl_mem wt, cl_mem x, cl_mem y, cl_mem bias,
+                      int m_i, int wout_i, int c_i, int w_i, int has_bias) const {
+    const int T = wout_i / 4;
+    const size_t u_sz = static_cast<size_t>(m_i) * static_cast<size_t>(c_i) * sizeof(cl_half);
+    const size_t v_sz = static_cast<size_t>(c_i) * static_cast<size_t>(T) * sizeof(cl_half);
+    const size_t p_sz = static_cast<size_t>(m_i) * static_cast<size_t>(T) * sizeof(cl_half);
+    std::lock_guard<std::mutex> guard(wino_mu_);
+    if (wino_m_ != m_i || wino_c_ != c_i || wino_t_ != T) {
+      cl_mem* sets[3] = {wino_u_, wino_v_, wino_p_};
+      for (cl_mem* arr : sets) {
+        for (int t = 0; t < 6; ++t) {
+          if (arr[t] != nullptr) clReleaseMemObject(arr[t]);
+          arr[t] = nullptr;
+        }
+      }
+      for (int t = 0; t < 6; ++t) {
+        cl_int e1 = CL_SUCCESS, e2 = CL_SUCCESS, e3 = CL_SUCCESS;
+        wino_u_[t] = clCreateBuffer(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, u_sz, nullptr, &e1);
+        wino_v_[t] = clCreateBuffer(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, v_sz, nullptr, &e2);
+        wino_p_[t] = clCreateBuffer(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, p_sz, nullptr, &e3);
+        ORT_ENFORCE(e1 == CL_SUCCESS && e2 == CL_SUCCESS && e3 == CL_SUCCESS,
+                    "WinogradConv: scratch allocation failed");
+      }
+      wino_m_ = m_i;
+      wino_c_ = c_i;
+      wino_t_ = T;
+      for (int t = 0; t < 6; ++t) {
+        ORT_RETURN_IF_ERROR(
+            KernelLauncher{GetKernel("WinoWeightT")}
+                .SetBuffer(wt)
+                .SetArg<cl_int>(m_i)
+                .SetArg<cl_int>(c_i)
+                .SetArg<cl_int>(t)
+                .SetBuffer(wino_u_[t])
+                .Launch(*exec_, NDRange(static_cast<size_t>(c_i), static_cast<size_t>(m_i))));
+      }
+    }
+    for (int t = 0; t < 6; ++t) {
+      ORT_RETURN_IF_ERROR(
+          KernelLauncher{GetKernel("WinoInputT")}
+              .SetBuffer(x)
+              .SetArg<cl_int>(c_i)
+              .SetArg<cl_int>(w_i)
+              .SetArg<cl_int>(2)
+              .SetArg<cl_int>(T)
+              .SetArg<cl_int>(t)
+              .SetBuffer(wino_v_[t])
+              .Launch(*exec_, NDRange(static_cast<size_t>(T), static_cast<size_t>(c_i))));
+    }
+    const size_t lx = 16;  // Gemm_Tiled_F16H work-group: GEMM_BN / GEMM_TN
+    const size_t ly = 16;  //                             GEMM_BM / GEMM_TM
+    const size_t gn = (static_cast<size_t>(T) + 63) / 64;
+    const size_t gm = (static_cast<size_t>(m_i) + 63) / 64;
+    const size_t cap0 = exec_->MaxWorkItemSize(0);
+    const size_t gn_used = std::min(gn, std::max<size_t>(1, cap0 / lx));
+    for (int t = 0; t < 6; ++t) {
+      ORT_RETURN_IF_ERROR(
+          KernelLauncher{GetKernel("Gemm_Tiled_F16H")}
+              .SetArg<cl_int>(m_i)
+              .SetArg<cl_int>(T)
+              .SetArg<cl_int>(c_i)
+              .SetArg<cl_int>(0)  // bias is applied by WinoOutputT
+              .SetArg<cl_int>(0)  // trans_a: U is [M, C]
+              .SetBuffer(wino_u_[t])
+              .SetBuffer(wino_v_[t])
+              .SetBuffer(wino_p_[t])
+              .SetBuffer(bias)
+              .Launch(*exec_, NDRange(gn_used * lx, gm * ly), NDRange(lx, ly)));
+    }
+    ORT_RETURN_IF_ERROR(
+        KernelLauncher{GetKernel("WinoOutputT")}
+            .SetBuffer(wino_p_[0])
+            .SetBuffer(wino_p_[1])
+            .SetBuffer(wino_p_[2])
+            .SetBuffer(wino_p_[3])
+            .SetBuffer(wino_p_[4])
+            .SetBuffer(wino_p_[5])
+            .SetArg<cl_int>(m_i)
+            .SetArg<cl_int>(T)
+            .SetArg<cl_int>(has_bias)
+            .SetBuffer(bias)
+            .SetBuffer(y)
+            .SetArg<cl_int>(wout_i)
+            .Launch(*exec_, NDRange(static_cast<size_t>(T), static_cast<size_t>(m_i))));
+    return Status::OK();
+  }
+
+  // DEV-ONLY (ORT_OPENCL_EXP=winograd): cached transform-domain tensors, one plane
+  // per transform point. Never released (process-lifetime; dev only).
+  mutable std::mutex wino_mu_;
+  mutable cl_mem wino_u_[6] = {};
+  mutable cl_mem wino_v_[6] = {};
+  mutable cl_mem wino_p_[6] = {};
+  mutable int wino_m_ = 0;
+  mutable int wino_c_ = 0;
+  mutable int wino_t_ = 0;
 };
 
 ONNX_OPENCL_OPERATOR_KERNEL(
