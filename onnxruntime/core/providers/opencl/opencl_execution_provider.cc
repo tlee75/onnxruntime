@@ -389,7 +389,21 @@ Status OpenCLExecutionProvider::InitOpenCLContext() {
   LOGS_DEFAULT(VERBOSE) << "[CL] device version: " << opencl::GetDeviceInfo(dev_, CL_DEVICE_VERSION);
   auto exts = opencl::GetDeviceInfo(dev_, CL_DEVICE_EXTENSIONS);
   LOGS_DEFAULT(VERBOSE) << "[CL] device extensions: " << exts << std::endl;
-  dev_info_.has_fp16 = exts.find("cl_khr_fp16") != std::string::npos;
+  // cl_khr_fp16 gives the half TYPE; CL_DEVICE_HALF_FP_CONFIG is what says the
+  // device actually has half-precision floating point (the same distinction as
+  // CL_DEVICE_DOUBLE_FP_CONFIG for cl_khr_fp64, cf. SupportsFp64()). A driver that
+  // advertises the extension while reporting no capability must not be handed
+  // half tensors: the kernels using `__global half*` build and enqueue, then the
+  // queue errors (CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST) at the next sync.
+  cl_device_fp_config half_fp = 0;
+  clGetDeviceInfo(dev_, CL_DEVICE_HALF_FP_CONFIG, sizeof(half_fp), &half_fp, nullptr);
+  const bool has_fp16_ext = exts.find("cl_khr_fp16") != std::string::npos;
+  dev_info_.has_fp16 = has_fp16_ext && half_fp != 0;
+  // WARNING, not INFO: this is the one fp16 fact a device bring-up needs, and
+  // session logs usually run at warning level.
+  LOGS_DEFAULT(WARNING) << "[CL] fp16: cl_khr_fp16=" << has_fp16_ext
+                        << " CL_DEVICE_HALF_FP_CONFIG=0x" << std::hex << half_fp << std::dec
+                        << " -> fp16 enabled=" << dev_info_.has_fp16;
   if (!dev_info_.has_fp16 && UseFp16()) {
     LOGS_DEFAULT(WARNING) << "[CL] FP16 is requested, but is not supported by the device!";
     DisableFp16();
