@@ -450,9 +450,14 @@ Status OpenCLExecutionProvider::Sync() const {
   return Status::OK();
 }
 
-void OpenCLExecutionProvider::ProfRecord(const char* name, cl_event ev) const {
+void OpenCLExecutionProvider::ProfRecord(const char* name, cl_event ev, uint64_t host_ns) const {
   std::lock_guard<std::mutex> g(prof_mu_);
-  prof_entries_.push_back({name, ev});
+  prof_entries_.push_back({name, ev, host_ns, 0});
+}
+
+void OpenCLExecutionProvider::ProfHostAdd(const char* name, uint64_t ns, uint64_t bytes) const {
+  std::lock_guard<std::mutex> g(prof_mu_);
+  prof_entries_.push_back({name, nullptr, ns, bytes});
 }
 
 void OpenCLExecutionProvider::ProfDump() const {
@@ -464,8 +469,9 @@ void OpenCLExecutionProvider::ProfDump() const {
   }
   clFinish(cmd_queue_);
 
-  struct Agg { uint64_t n = 0, gpu = 0; };
+  struct Agg { uint64_t n = 0, gpu = 0, host = 0, bytes = 0; };
   std::unordered_map<std::string, Agg> agg;
+  std::vector<std::pair<cl_ulong, cl_ulong>> spans;
   for (auto& e : entries) {
     uint64_t gpu = 0;
     cl_ulong s = 0, t = 0;
@@ -473,24 +479,46 @@ void OpenCLExecutionProvider::ProfDump() const {
         clGetEventProfilingInfo(e.ev, CL_PROFILING_COMMAND_START, sizeof(s), &s, nullptr) == CL_SUCCESS &&
         clGetEventProfilingInfo(e.ev, CL_PROFILING_COMMAND_END, sizeof(t), &t, nullptr) == CL_SUCCESS) {
       gpu = static_cast<uint64_t>(t - s);
+      spans.emplace_back(s, t);
     }
     auto& a = agg[e.name];
     a.n++;
     a.gpu += gpu;
+    a.host += e.host_ns;
+    a.bytes += e.bytes;
     if (e.ev) clReleaseEvent(e.ev);
   }
 
   std::vector<std::pair<std::string, Agg>> v(agg.begin(), agg.end());
   std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.gpu > b.second.gpu; });
-  uint64_t tg = 0, tn = 0;
-  LOGS_DEFAULT(WARNING) << "[CLPROF] ===== per-kernel GPU time, " << entries.size() << " launches =====";
+  uint64_t tg = 0, tn = 0, th = 0, tb = 0;
+  LOGS_DEFAULT(WARNING) << "[CLPROF] ===== per-kernel GPU + host time, " << entries.size() << " entries =====";
   for (auto& kv : v) {
     LOGS_DEFAULT(WARNING) << "[CLPROF] " << kv.first << " n=" << kv.second.n
-                          << " gpu_us=" << (kv.second.gpu / 1000);
+                          << " gpu_us=" << (kv.second.gpu / 1000)
+                          << " host_us=" << (kv.second.host / 1000)
+                          << (kv.second.bytes ? " bytes=" + std::to_string(kv.second.bytes) : "");
     tg += kv.second.gpu;
     tn += kv.second.n;
+    th += kv.second.host;
+    tb += kv.second.bytes;
   }
-  LOGS_DEFAULT(WARNING) << "[CLPROF] TOTAL n=" << tn << " gpu_us=" << (tg / 1000);
+  LOGS_DEFAULT(WARNING) << "[CLPROF] TOTAL n=" << tn << " gpu_us=" << (tg / 1000)
+                        << " host_us=" << (th / 1000) << " bytes=" << tb;
+  // Timeline: the GPU's own span vs the time it was actually executing. span - busy
+  // is time the GPU spent idle between launches, i.e. starving for work.
+  if (!spans.empty()) {
+    std::sort(spans.begin(), spans.end());
+    cl_ulong first = spans.front().first;
+    cl_ulong last_end = spans.front().second;
+    cl_ulong gaps = 0;
+    for (size_t i = 1; i < spans.size(); ++i) {
+      if (spans[i].first > last_end) gaps += spans[i].first - last_end;
+      if (spans[i].second > last_end) last_end = spans[i].second;
+    }
+    LOGS_DEFAULT(WARNING) << "[CLPROF] timeline span_us=" << ((last_end - first) / 1000)
+                          << " busy_us=" << (tg / 1000) << " idle_gaps_us=" << (gaps / 1000);
+  }
 }
 
 #ifdef TRACY_ENABLE

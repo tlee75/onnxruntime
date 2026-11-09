@@ -5,6 +5,8 @@
 #include "opencl_program_manager.h"
 #include "opencl_data_transfer.h"
 
+#include <chrono>
+
 #include "core/framework/ortdevice.h"
 #include "core/framework/tensor.h"
 
@@ -36,7 +38,12 @@ Status OpenCLGPUDataTransfer::CopyTensor(const Tensor& src, Tensor& dst) const {
     ORT_RETURN_IF_NOT(src.ByteOffset() == 0, "Copy with byte offset is not supported");
     if (dst_device.MemType() == OrtDevice::MemType::DEFAULT) {
       VLOGF_DEFAULT(V_COPY, "Copy    host(%p) ---> Buffer(%p)", src.DataRaw(), CL_BUFFER_FROM_TENSOR(dst));
+      const auto _t0 = std::chrono::steady_clock::now();
       ORT_RETURN_IF_CL_ERROR(clEnqueueWriteBuffer(exec_->GetCommandQueue(), CL_BUFFER_FROM_TENSOR(dst), /*blocking_write=*/CL_TRUE, /*offset=*/0, src.SizeInBytes(), src.DataRaw(), 0, nullptr, nullptr));
+      if (exec_->TuneEnabledLevel()) {
+        exec_->ProfHostAdd("h2d_write", static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - _t0).count()), src.SizeInBytes());
+      }
       return Status::OK();
     }
   }
@@ -46,8 +53,13 @@ Status OpenCLGPUDataTransfer::CopyTensor(const Tensor& src, Tensor& dst) const {
     ORT_RETURN_IF_NOT(dst.ByteOffset() == 0, "Copy with byte offset is not supported");
     if (src_device.MemType() == OrtDevice::MemType::DEFAULT) {
       VLOGF_DEFAULT(V_COPY, "Copy  Buffer(%p) -----> host(%p)", CL_BUFFER_FROM_TENSOR(src), dst.DataRaw());
+      const auto _t0 = std::chrono::steady_clock::now();
       ORT_RETURN_IF_CL_ERROR(clEnqueueReadBuffer(exec_->GetCommandQueue(), CL_BUFFER_FROM_TENSOR(src), /*blocking_read=*/CL_TRUE, /*offset=*/0, dst.SizeInBytes(), dst.MutableDataRaw(), 0, nullptr, nullptr));
-      exec_->ProfDump();  // per-kernel GPU totals for this run (tune switch only)
+      if (exec_->TuneEnabledLevel()) {
+        exec_->ProfHostAdd("d2h_read", static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - _t0).count()), dst.SizeInBytes());
+      }
+      exec_->ProfDump();  // per-kernel GPU/host totals for this run (tune switch only)
       return Status::OK();
     }
   }

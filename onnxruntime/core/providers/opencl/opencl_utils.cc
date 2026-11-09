@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include <chrono>
+
 #include "opencl_utils.h"
 #include "opencl_execution_provider.h"
 #include "opencl_program_manager.h"
@@ -245,11 +247,14 @@ Status KernelLauncher::Launch(const OpenCLExecutionProvider& exec, const NDRange
   }
 #else
   cl_event _ev = nullptr;
+  const auto _t0 = std::chrono::steady_clock::now();
   ORT_RETURN_IF_CL_ERROR(clEnqueueNDRangeKernel(exec.GetCommandQueue(), kernel_, global_.Size(), nullptr,
                                                 global_.Data(), local_.Data(), 0, nullptr,
                                                 exec.TuneEnabledLevel() ? &_ev : nullptr));
   if (exec.TuneEnabledLevel()) {
-    const_cast<OpenCLExecutionProvider&>(exec).ProfRecord(GetKernelFunctionName().c_str(), _ev);
+    const auto host_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _t0).count());
+    const_cast<OpenCLExecutionProvider&>(exec).ProfRecord(GetKernelFunctionName().c_str(), _ev, host_ns);
   }
 #endif
   return exec.AfterCLLaunch();

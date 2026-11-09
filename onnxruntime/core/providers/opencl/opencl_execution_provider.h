@@ -146,7 +146,9 @@ class OpenCLExecutionProvider : public IExecutionProvider {
   /// Measurement-only (armed by the tune switch, see InitOpenCLContext): per-kernel
   /// GPU timing. KernelLauncher calls ProfRecord() with the launch's profiling event;
   /// ProfDump() clFinishes, sums the events per kernel name and logs the totals.
-  void ProfRecord(const char* name, cl_event ev) const;
+  void ProfRecord(const char* name, cl_event ev, uint64_t host_ns) const;
+  /// Pseudo-entry for a host<->device copy: no event, but bytes and host time.
+  void ProfHostAdd(const char* name, uint64_t ns, uint64_t bytes) const;
   void ProfDump() const;
 
   const std::string GetCompileOptions() const { return compile_options_; };
@@ -192,6 +194,8 @@ class OpenCLExecutionProvider : public IExecutionProvider {
   struct ProfEntry {
     std::string name;
     cl_event ev;
+    uint64_t host_ns;
+    uint64_t bytes;
   };
   mutable std::mutex prof_mu_;
   mutable std::vector<ProfEntry> prof_entries_;
