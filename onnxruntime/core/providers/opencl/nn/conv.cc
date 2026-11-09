@@ -205,6 +205,11 @@ class Conv : public OpenCLKernel {
         //   conv_tm8      - TM=TN=8 (a 4x larger per-thread register block)
         //   conv_nogather - DIAGNOSTIC: a contiguous read that prices the strided
         //                   im2col gather (WRONG output; timing only)
+        // DEV-ONLY premise test (ORT_OPENCL_EXP=conv_halfk): the SAME conv with a
+        // HALVED reduction depth (C*K/2) -- half the MACs AND half the A/B loads,
+        // which is what a reduction-depth-cutting algorithm (Winograd's
+        // transform-domain GEMM) does. Wrong output on purpose; timing only.
+        const int k_eff = (exec_->Exp() == "conv_halfk") ? std::max<int>(1, k_i / 2) : k_i;
         const char* exp_kernel = nullptr;
         int gtm = kGemmTM;
         int gtn = kGemmTN;
@@ -218,7 +223,7 @@ class Conv : public OpenCLKernel {
         }
         const ConvTile tile = exp_kernel ? ConvTile{64, 64}
                                          : ChooseConvTile(m_i, wout_i, cap0, f16, h, a, x, y, bias,
-                                                          c_i, w_i, k_i, static_cast<int>(stride),
+                                                          c_i, w_i, k_eff, static_cast<int>(stride),
                                                           static_cast<int>(pad_l),
                                                           static_cast<int>(dilation), has_bias);
         const size_t flx = tile.bn / static_cast<size_t>(gtn);
@@ -227,7 +232,7 @@ class Conv : public OpenCLKernel {
         const size_t fgn = (static_cast<size_t>(wout_i) + tile.bn - 1) / tile.bn;
         const size_t fgn_used = std::min(fgn, std::max<size_t>(1, cap0 / flx));
         KernelLauncher kl{GetKernel(exp_kernel ? exp_kernel : ConvTileKernel(tile, f16, h))};
-        BindConvGemm(kl, a, x, y, bias, m_i, wout_i, c_i, w_i, k_i,
+        BindConvGemm(kl, a, x, y, bias, m_i, wout_i, c_i, w_i, k_eff,
                      static_cast<int>(stride), static_cast<int>(pad_l),
                      static_cast<int>(dilation), has_bias);
         ORT_RETURN_IF_ERROR(
