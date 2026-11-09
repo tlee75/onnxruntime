@@ -4,7 +4,9 @@
 #include "convtranspose.h"
 
 #include <algorithm>
+#include <array>
 #include <limits>
+#include <mutex>
 #include <vector>
 
 #include "core/providers/opencl/opencl_kernel.h"
@@ -53,6 +55,11 @@ class ConvTranspose : public OpenCLKernel {
       // Half-*storage* twins for an fp16 graph (its tensors are half).
       LoadKernel("Gemm_Tiled_F16H");
       LoadKernel("ConvTranspose_Col2im_F16H");
+      // DEV-ONLY (ORT_OPENCL_EXP=winoct): the phase-Winograd path in Compute().
+      LoadKernel("WinoCtGather");
+      LoadKernel("WinoWeightT");
+      LoadKernel("WinoInputT");
+      LoadKernel("WinoOutputT");
     }
   }
 
@@ -112,6 +119,20 @@ class ConvTranspose : public OpenCLKernel {
       cl_mem wt = CL_BUFFER_FROM_TENSOR(*Wt);
       cl_mem x = CL_BUFFER_FROM_TENSOR(*X);
       cl_mem y = CL_BUFFER_FROM_TENSOR(*Y);
+
+      // DEV-ONLY (ORT_OPENCL_EXP=winoct): a stride-s transposed conv splits into s
+      // PHASE convs of ~K/s taps; here K == 2s, so each phase is exactly 2 taps --
+      // and a 2-tap filter is a 3-tap one with a zero third, so each phase runs the
+      // verified F(4,3) pipeline (NS=1) with its own pad and writes every os-th
+      // output element directly (no col2im). 6 multiplies / 4 outputs vs 8 for the
+      // direct 2-tap, i.e. 1.33x.
+      if (IsHalf(*X) && exec_->Exp().find("winoct") != std::string::npos &&
+          stride > 1 && dilation == 1 && K == 2 * stride) {
+        ORT_RETURN_IF_ERROR(WinogradCtPhases(wt, x, y, bias, has_bias, m_i, wout_i,
+                                             c_i, w_i, k_i, static_cast<int>(stride),
+                                             static_cast<int>(pad_l)));
+        return Status::OK();
+      }
 
       cl_mem p = exec_->GetScratchBufferTmp(static_cast<size_t>(mk) * w_i * sizeof(float));
 
@@ -187,6 +208,131 @@ class ConvTranspose : public OpenCLKernel {
   std::vector<int64_t> pads_;
   std::vector<int64_t> dilations_;
   std::vector<int64_t> output_padding_;
+
+  // DEV-ONLY (ORT_OPENCL_EXP=winoct): per-phase transform-domain tensors, cached
+  // per shape. Never released (process-lifetime; dev only).
+  mutable std::mutex ct_mu_;
+  mutable std::vector<std::array<cl_mem, 6>> ct_u_, ct_v_, ct_p_;
+  mutable std::vector<cl_mem> ct_wp_;
+  mutable std::vector<long> ct_key_;
+
+  /// DEV-ONLY (ORT_OPENCL_EXP=winoct): the ConvTranspose phase path (see Compute).
+  Status WinogradCtPhases(cl_mem wt, cl_mem x, cl_mem y, cl_mem bias, int has_bias,
+                          int m_i, int wout_i, int c_i, int w_i, int k_i,
+                          int os, int pad_l) const {
+    if (static_cast<int>(ct_key_.size()) < os) {
+      ct_u_.resize(os);
+      ct_v_.resize(os);
+      ct_p_.resize(os);
+      ct_wp_.resize(os, nullptr);
+      ct_key_.resize(os, 0);
+    }
+    std::lock_guard<std::mutex> guard(ct_mu_);
+    for (int r = 0; r < os; ++r) {
+      const int k0 = (r + pad_l) % os;
+      const int a0 = (r + pad_l - k0) / os;
+      const int pad3 = 1 - a0;  // the phase, as a 3-tap correlation's pad
+      const int Q = (wout_i - r + os - 1) / os;
+      if (Q <= 0) continue;
+      const int T = (Q + 3) / 4;
+      const size_t mc = static_cast<size_t>(m_i) * static_cast<size_t>(c_i);
+      const size_t ct = static_cast<size_t>(c_i) * static_cast<size_t>(T);
+      const size_t mt = static_cast<size_t>(m_i) * static_cast<size_t>(T);
+      const long key = static_cast<long>(m_i) * 1000000007L + static_cast<long>(c_i) * 100003L + T;
+      if (ct_key_[r] != key) {
+        for (int t = 0; t < 6; ++t) {
+          if (ct_u_[r][t]) clReleaseMemObject(ct_u_[r][t]);
+          if (ct_v_[r][t]) clReleaseMemObject(ct_v_[r][t]);
+          if (ct_p_[r][t]) clReleaseMemObject(ct_p_[r][t]);
+          cl_int e = CL_SUCCESS;
+          ct_u_[r][t] = clCreateBuffer(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, mc * 3 * sizeof(cl_half), nullptr, &e);
+          ct_v_[r][t] = clCreateBuffer(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, ct * sizeof(cl_half), nullptr, &e);
+          ct_p_[r][t] = clCreateBuffer(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, mt * sizeof(cl_half), nullptr, &e);
+          ORT_ENFORCE(e == CL_SUCCESS, "WinogradCtPhases: scratch allocation failed");
+        }
+        if (ct_wp_[r]) clReleaseMemObject(ct_wp_[r]);
+        cl_int e = CL_SUCCESS;
+        ct_wp_[r] = clCreateBuffer(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, mc * 3 * sizeof(cl_half), nullptr, &e);
+        ORT_ENFORCE(e == CL_SUCCESS, "WinogradCtPhases: scratch allocation failed");
+        // This phase's two taps -> Wp[M][C][3]; U depends only on Wp, so both are
+        // built once per shape.
+        ORT_RETURN_IF_ERROR(
+            KernelLauncher{GetKernel("WinoCtGather")}
+                .SetBuffer(wt)
+                .SetArg<cl_int>(m_i)
+                .SetArg<cl_int>(c_i)
+                .SetArg<cl_int>(k_i)
+                .SetArg<cl_int>(os)
+                .SetArg<cl_int>(k0)
+                .SetBuffer(ct_wp_[r])
+                .Launch(*exec_, NDRange(static_cast<size_t>(c_i), static_cast<size_t>(m_i))));
+        for (int t = 0; t < 6; ++t) {
+          ORT_RETURN_IF_ERROR(
+              KernelLauncher{GetKernel("WinoWeightT")}
+                  .SetBuffer(ct_wp_[r])
+                  .SetArg<cl_int>(m_i)
+                  .SetArg<cl_int>(c_i)
+                  .SetArg<cl_int>(3)  // K
+                  .SetArg<cl_int>(1)  // NS
+                  .SetArg<cl_int>(t)
+                  .SetBuffer(ct_u_[r][t])
+                  .Launch(*exec_, NDRange(static_cast<size_t>(c_i), static_cast<size_t>(m_i))));
+        }
+        ct_key_[r] = key;
+      }
+      for (int t = 0; t < 6; ++t) {
+        ORT_RETURN_IF_ERROR(
+            KernelLauncher{GetKernel("WinoInputT")}
+                .SetBuffer(x)
+                .SetArg<cl_int>(c_i)
+                .SetArg<cl_int>(w_i)
+                .SetArg<cl_int>(1)  // NS
+                .SetArg<cl_int>(pad3)
+                .SetArg<cl_int>(T)
+                .SetArg<cl_int>(t)
+                .SetBuffer(ct_v_[r][t])
+                .Launch(*exec_, NDRange(static_cast<size_t>(T), static_cast<size_t>(c_i))));
+      }
+      const size_t lx = 16;  // Gemm_Tiled_F16H work-group: GEMM_BN / GEMM_TN
+      const size_t ly = 16;  //                             GEMM_BM / GEMM_TM
+      const size_t gn = (static_cast<size_t>(T) + 63) / 64;
+      const size_t gm = (static_cast<size_t>(m_i) + 63) / 64;
+      const size_t cap0 = exec_->MaxWorkItemSize(0);
+      const size_t gn_used = std::min(gn, std::max<size_t>(1, cap0 / lx));
+      for (int t = 0; t < 6; ++t) {
+        ORT_RETURN_IF_ERROR(
+            KernelLauncher{GetKernel("Gemm_Tiled_F16H")}
+                .SetArg<cl_int>(m_i)
+                .SetArg<cl_int>(T)
+                .SetArg<cl_int>(c_i)
+                .SetArg<cl_int>(0)  // bias is applied by WinoOutputT
+                .SetArg<cl_int>(0)  // trans_a: U is [M, C]
+                .SetBuffer(ct_u_[r][t])
+                .SetBuffer(ct_v_[r][t])
+                .SetBuffer(ct_p_[r][t])
+                .SetBuffer(bias)
+                .Launch(*exec_, NDRange(gn_used * lx, gm * ly), NDRange(lx, ly)));
+      }
+      ORT_RETURN_IF_ERROR(
+          KernelLauncher{GetKernel("WinoOutputT")}
+              .SetBuffer(ct_p_[r][0])
+              .SetBuffer(ct_p_[r][1])
+              .SetBuffer(ct_p_[r][2])
+              .SetBuffer(ct_p_[r][3])
+              .SetBuffer(ct_p_[r][4])
+              .SetBuffer(ct_p_[r][5])
+              .SetArg<cl_int>(m_i)
+              .SetArg<cl_int>(T)
+              .SetArg<cl_int>(has_bias)
+              .SetBuffer(bias)
+              .SetBuffer(y)
+              .SetArg<cl_int>(wout_i)
+              .SetArg<cl_int>(os)
+              .SetArg<cl_int>(r)
+              .Launch(*exec_, NDRange(static_cast<size_t>(T), static_cast<size_t>(m_i))));
+    }
+    return Status::OK();
+  }
 };
 
 ONNX_OPENCL_OPERATOR_KERNEL(

@@ -409,3 +409,116 @@ void Gemm_Tiled_F16H(
   }
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// DEV-ONLY (ORT_OPENCL_EXP=winograd / winoct): 1D Winograd F(4,3) transforms.
+// They live in gemm.cl because BOTH conv.cl and convtranspose.cl include this
+// file, so one definition serves both programs. If this ever ships, move them to
+// nn/kernels/winograd.cl and include that from both.
+//
+//   U[t][m][row] = sum_rr G[t][rr] * W[m][row*3 + rr]        (weights, computed once)
+//   V[t][row][j] = sum_rr Bt[t][rr] * X[c][4j - pad + 3s + rr]
+//   P[t]         = U[t] @ V[t]                               (Gemm_Tiled_F16H)
+//   Y[m][os*(4j+q)+r] = bias[m] + sum_t At[q][t] * P[t][m][j]
+// with row = s*C + c, s in [0, NS) a 3-tap slice of the original kernel (K=3 is
+// NS=1, K=7 is NS=3 with the third slice zero-padded; a ConvTranspose PHASE is
+// NS=1 with two real taps and a zero third).
+#if defined(cl_khr_fp16)
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+
+__kernel void WinoWeightT(__global const half* Wt, const int M, const int C,
+                          const int K, const int NS, const int t, __global half* U_t) {
+  const int row = get_global_id(0);  // s*C + c
+  const int m = get_global_id(1);
+  const int NC = NS * C;
+  if (m >= M || row >= NC) return;
+  const int s = row / C;
+  const int c = row - s * C;
+  const int b = m * (C * K) + c * K + 3 * s;
+  const float g0 = (3 * s + 0 < K) ? (float)Wt[b] : 0.0f;
+  const float g1 = (3 * s + 1 < K) ? (float)Wt[b + 1] : 0.0f;
+  const float g2 = (3 * s + 2 < K) ? (float)Wt[b + 2] : 0.0f;
+  float u;
+  if (t == 0) u = 0.25f * g0;
+  else if (t == 1) u = -(g0 + g1 + g2) / 6.0f;
+  else if (t == 2) u = (-g0 + g1 - g2) / 6.0f;
+  else if (t == 3) u = g0 / 24.0f + g1 / 12.0f + g2 / 6.0f;
+  else if (t == 4) u = g0 / 24.0f - g1 / 12.0f + g2 / 6.0f;
+  else u = g2;
+  U_t[m * NC + row] = (half)u;
+}
+
+__kernel void WinoInputT(__global const half* X, const int C, const int W,
+                         const int NS, const int pad, const int T, const int t,
+                         __global half* V_t) {
+  const int j = get_global_id(0);
+  const int row = get_global_id(1);  // s*C + c
+  const int NC = NS * C;
+  if (j >= T || row >= NC) return;
+  const int s = row / C;
+  const int c = row - s * C;
+  const int base = 4 * j - pad + 3 * s;
+  float d[6];
+  for (int r = 0; r < 6; ++r) {
+    const int iw = base + r;
+    d[r] = (iw >= 0 && iw < W) ? (float)X[c * W + iw] : 0.0f;
+  }
+  float v;
+  if (t == 0) v = 4.0f * d[0] - 5.0f * d[2] + d[4];
+  else if (t == 1) v = -4.0f * d[1] - 4.0f * d[2] + d[3] + d[4];
+  else if (t == 2) v = 4.0f * d[1] - 4.0f * d[2] - d[3] + d[4];
+  else if (t == 3) v = -2.0f * d[1] - d[2] + 2.0f * d[3] + d[4];
+  else if (t == 4) v = 2.0f * d[1] - d[2] - 2.0f * d[3] + d[4];
+  else v = 4.0f * d[1] - 5.0f * d[3] + d[5];
+  V_t[row * T + j] = (half)v;
+}
+
+// os/r place the tile in the output: os=1,r=0 for a plain Conv, and os=stride,
+// r=phase for a ConvTranspose phase (which writes every os-th element).
+__kernel void WinoOutputT(__global const half* P0, __global const half* P1,
+                          __global const half* P2, __global const half* P3,
+                          __global const half* P4, __global const half* P5,
+                          const int M, const int T, const int has_bias,
+                          __global const half* B, __global half* Y, const int Wout,
+                          const int os, const int r) {
+  const int j = get_global_id(0);
+  const int m = get_global_id(1);
+  if (j >= T || m >= M) return;
+  const int o = m * T + j;
+  const float p0 = (float)P0[o], p1 = (float)P1[o], p2 = (float)P2[o];
+  const float p3 = (float)P3[o], p4 = (float)P4[o], p5 = (float)P5[o];
+  const float bias = has_bias ? (float)B[m] : 0.0f;
+  const float y0 = p0 + p1 + p2 + p3 + p4;
+  const float y1 = p1 - p2 + 2.0f * p3 - 2.0f * p4;
+  const float y2 = p1 + p2 + 4.0f * p3 + 4.0f * p4;
+  const float y3 = p1 - p2 + 8.0f * p3 - 8.0f * p4 + p5;
+  const int q0 = 4 * j;
+  const int ow0 = os * q0 + r;
+  if (ow0 < Wout) Y[m * Wout + ow0] = (half)(y0 + bias);
+  if (os * (q0 + 1) + r < Wout) Y[m * Wout + os * (q0 + 1) + r] = (half)(y1 + bias);
+  if (os * (q0 + 2) + r < Wout) Y[m * Wout + os * (q0 + 2) + r] = (half)(y2 + bias);
+  if (os * (q0 + 3) + r < Wout) Y[m * Wout + os * (q0 + 3) + r] = (half)(y3 + bias);
+}
+
+// DEV-ONLY (ORT_OPENCL_EXP=winoct): gather ONE ConvTranspose phase's two taps --
+// k0 = (r+pad) mod s and k0+s of the [C][M*K] weight -- into a [M][C][3] filter
+// [w(k0+s), w(k0), 0] that the F(4,3) pipeline can consume. The phase window
+// starts at 4q + a0 with a0 = (r + pad - k0)/s, so as a 3-tap correlation its pad
+// is 1 - a0.
+__kernel void WinoCtGather(__global const half* Wt, const int M, const int C,
+                           const int K, const int s, const int k0,
+                           __global half* Wp) {
+  const int c = get_global_id(0);
+  const int m = get_global_id(1);
+  if (m >= M || c >= C) return;
+  const int base = c * (M * K) + m * K + k0;
+  // g[0] multiplies x[q + a0 - 1], which comes from tap k0+s; g[1] multiplies
+  // x[q + a0], from tap k0 (pad3 = 1 - a0 puts those at rr = 0 and 1).
+  const float g0 = (k0 + s < K) ? (float)Wt[base + s] : 0.0f;  // tap k0+s
+  const float g1 = (k0 < K) ? (float)Wt[base] : 0.0f;          // tap k0
+  const int o = (m * C + c) * 3;
+  Wp[o + 0] = (half)g0;
+  Wp[o + 1] = (half)g1;
+  Wp[o + 2] = (half)0;
+}
+#endif

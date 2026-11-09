@@ -208,8 +208,8 @@ class Conv : public OpenCLKernel {
         // k>=3 conv, decomposed into ceil(K/3) 3-tap slices stacked along the
         // reduction (K=3 is one slice, K=7 is three). Any pad works: slice s's
         // window starts at 4j - pad + 3s.
-        if (h && exec_->Exp() == "winograd" && k_i >= 3 && stride == 1 && dilation == 1 &&
-            (wout_i % 4) == 0 && m_i > 0 && c_i > 0) {
+        if (h && exec_->Exp().find("winograd") != std::string::npos && k_i >= 3 &&
+            stride == 1 && dilation == 1 && (wout_i % 4) == 0 && m_i > 0 && c_i > 0) {
           ORT_RETURN_IF_ERROR(WinogradConv(a, x, y, bias, m_i, wout_i, c_i, w_i, k_i,
                                            static_cast<int>(pad_l), has_bias));
           return Status::OK();
@@ -538,6 +538,8 @@ class Conv : public OpenCLKernel {
             .SetBuffer(bias)
             .SetBuffer(y)
             .SetArg<cl_int>(wout_i)
+            .SetArg<cl_int>(1)  // os: a plain conv writes every element
+            .SetArg<cl_int>(0)  // r
             .Launch(*exec_, NDRange(static_cast<size_t>(T), static_cast<size_t>(m_i))));
     return Status::OK();
   }
