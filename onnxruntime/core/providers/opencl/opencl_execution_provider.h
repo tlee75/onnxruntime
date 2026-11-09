@@ -165,6 +165,13 @@ class OpenCLExecutionProvider : public IExecutionProvider {
 
   const std::string GetCompileOptions() const { return compile_options_; };
 
+  /// DEV-ONLY variant selector: the `ORT_OPENCL_EXP` environment variable, read
+  /// once at construction. The hosts consult it to choose between VARIANTS of the
+  /// same kernel (e.g. a different register tile) so both can run in ONE process --
+  /// which is what makes the bench's paired A/B immune to the device's thermal
+  /// drift. Measurement scaffolding: it must never be part of the upstream series.
+  const std::string& Exp() const { return exp_; }
+
   /// OpenCLKernel use it to initialize OpenCLKernelHolder
   const opencl::OpenCLProgramManager& GetProgramManager() const;
   opencl::OpenCLProgramManager& GetProgramManager();
@@ -184,6 +191,7 @@ class OpenCLExecutionProvider : public IExecutionProvider {
   bool use_fp16_;
   bool flush_after_launch_;
   std::string compile_options_;
+  std::string exp_;  // ORT_OPENCL_EXP (dev-only variant selector; see Exp())
   opencl::OpenCLDeviceInfo dev_info_;
 
   // Metadata upload cache (see GetOrUploadMetadata): key -> device buffer +

@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -245,6 +246,9 @@ bool ShouldFlushAfterLaunch(const std::string& device_name) {
 OpenCLExecutionProvider::OpenCLExecutionProvider(const OpenCLExecutionProviderInfo& info)
     : IExecutionProvider{kOpenCLExecutionProvider, OrtDevice(OrtDevice::GPU, OrtDevice::MemType::DEFAULT, 0)}, auto_runing_level_(info.auto_runing_level), use_fp16_(info.use_fp16) {
   Status status;
+  // DEV-ONLY experiment selector (see Exp()): read once at construction, so a
+  // session keeps its variant even if the environment changes afterwards.
+  if (const char* e = std::getenv("ORT_OPENCL_EXP")) exp_ = e;
 #ifdef CL3W_ENABLE
   if (cl3wInit() != CL3W_OK) {
     ORT_THROW("cl3w initialization failure.");

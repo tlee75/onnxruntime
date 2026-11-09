@@ -67,6 +67,8 @@ class Conv : public OpenCLKernel {
       LoadKernel("Gemm_Tiled_Conv_BM32_H");
       LoadKernel("Gemm_Tiled_Conv_BM16_H");
       LoadKernel("Gemm_Tiled_Conv_BN32_H");
+      // DEV-ONLY (ORT_OPENCL_EXP=conv_tm8): the same tile, larger register block.
+      LoadKernel("Gemm_Tiled_Conv_H_TM8");
     }
   }
 
@@ -164,16 +166,23 @@ class Conv : public OpenCLKernel {
         // asked for it (half the local memory => better occupancy, half2 MAC).
         const bool f16 = exec_->SupportsFp16() && exec_->UseFp16();
         const bool h = IsHalf(*X);
-        const ConvTile tile = ChooseConvTile(m_i, wout_i, cap0, f16, h, a, x, y, bias,
-                                             c_i, w_i, k_i, static_cast<int>(stride),
-                                             static_cast<int>(pad_l),
-                                             static_cast<int>(dilation), has_bias);
-        const size_t flx = tile.bn / kGemmTN;
-        const size_t fly = tile.bm / kGemmTM;
+        // DEV-ONLY A/B (ORT_OPENCL_EXP=conv_tm8): the same 64x64 tile with a larger
+        // register block (TM=TN=8 -> an 8x8 work-group). Only meaningful for the
+        // half-storage kernel it was instantiated for.
+        const bool tm8 = h && exec_->Exp() == "conv_tm8";
+        const ConvTile tile = tm8 ? ConvTile{64, 64}
+                                  : ChooseConvTile(m_i, wout_i, cap0, f16, h, a, x, y, bias,
+                                                   c_i, w_i, k_i, static_cast<int>(stride),
+                                                   static_cast<int>(pad_l),
+                                                   static_cast<int>(dilation), has_bias);
+        const size_t gtn = tm8 ? 8 : kGemmTN;
+        const size_t gtm = tm8 ? 8 : kGemmTM;
+        const size_t flx = tile.bn / gtn;
+        const size_t fly = tile.bm / gtm;
         const size_t fgm = (static_cast<size_t>(m_i) + tile.bm - 1) / tile.bm;
         const size_t fgn = (static_cast<size_t>(wout_i) + tile.bn - 1) / tile.bn;
         const size_t fgn_used = std::min(fgn, std::max<size_t>(1, cap0 / flx));
-        KernelLauncher kl{GetKernel(ConvTileKernel(tile, f16, h))};
+        KernelLauncher kl{GetKernel(tm8 ? "Gemm_Tiled_Conv_H_TM8" : ConvTileKernel(tile, f16, h))};
         BindConvGemm(kl, a, x, y, bias, m_i, wout_i, c_i, w_i, k_i,
                      static_cast<int>(stride), static_cast<int>(pad_l),
                      static_cast<int>(dilation), has_bias);

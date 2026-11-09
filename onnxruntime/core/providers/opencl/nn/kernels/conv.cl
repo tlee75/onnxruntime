@@ -383,4 +383,8 @@ DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_H, 64, 64, 32, 4, 4)
 DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_BM32_H, 32, 64, 32, 4, 4)
 DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_BM16_H, 16, 64, 32, 4, 4)
 DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_BN32_H, 64, 32, 32, 4, 4)
+// DEV-ONLY experiment: the same tile with a larger register block (TM=TN=8, so a
+// 8x8 work-group and 4x the outputs per work-item). Selected by ORT_OPENCL_EXP so
+// the bench's paired A/B can run both in one process. NOT for the upstream series.
+DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_H_TM8, 64, 64, 32, 8, 8)
 #endif
