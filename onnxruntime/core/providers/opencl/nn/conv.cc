@@ -80,7 +80,7 @@ class Conv : public OpenCLKernel {
   /// True when the tensor is half, i.e. an fp16 graph: its storage is half, so the
   /// *_F16H kernels (not the fp32-storage *_F16 ones) are the matching pair.
   static bool IsHalf(const Tensor& t) {
-    return t.DataType() == DataTypeImpl::GetTensorType<MLFloat16>();
+    return IsFp16Tensor(t);
   }
 
   Status Compute(OpKernelContext* context) const override {

@@ -64,7 +64,7 @@ class ConvTranspose : public OpenCLKernel {
   }
 
   static bool IsHalf(const Tensor& t) {
-    return t.DataType() == DataTypeImpl::GetTensorType<MLFloat16>();
+    return IsFp16Tensor(t);
   }
 
   Status Compute(OpKernelContext* context) const override {
