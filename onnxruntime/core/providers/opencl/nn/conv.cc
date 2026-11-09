@@ -208,12 +208,16 @@ class Conv : public OpenCLKernel {
           }
           LOGS_DEFAULT(WARNING) << "[CL] image2d path unavailable; using buffers";
         }
-        // DEV-ONLY (ORT_OPENCL_EXP=winograd): 1D Winograd F(4,3) for any stride-1
-        // k>=3 conv, decomposed into ceil(K/3) 3-tap slices stacked along the
-        // reduction (K=3 is one slice, K=7 is three). Any pad works: slice s's
-        // window starts at 4j - pad + 3s.
-        if (h && exec_->Exp().find("winograd") != std::string::npos && k_i >= 3 &&
-            stride == 1 && dilation == 1 && (wout_i % 4) == 0 && m_i > 0 && c_i > 0) {
+        // 1D Winograd F(4,3) for any stride-1 k>=3 conv, decomposed into ceil(K/3)
+        // 3-tap slices stacked along the reduction (K=3 is one slice, K=7 is three);
+        // any pad works, slice s's window starts at 4j - pad + 3s. Half-storage
+        // only, so the fp32 path is untouched. `ORT_OPENCL_EXP=nowino` forces the
+        // im2col+GEMM fallback -- dev-only scaffolding, kept so the win stays
+        // measurable (docs/ORT_GPU_IMAGE2D_PROPOSAL.md section 8).
+        const bool wino = h && k_i >= 3 && stride == 1 && dilation == 1 &&
+                          (wout_i % 4) == 0 && m_i > 0 && c_i > 0 &&
+                          exec_->Exp().find("nowino") == std::string::npos;
+        if (wino) {
           ORT_RETURN_IF_ERROR(WinogradConv(a, x, y, bias, m_i, wout_i, c_i, w_i, k_i,
                                            static_cast<int>(pad_l), has_bias));
           return Status::OK();

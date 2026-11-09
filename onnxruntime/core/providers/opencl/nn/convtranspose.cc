@@ -121,13 +121,13 @@ class ConvTranspose : public OpenCLKernel {
       cl_mem x = CL_BUFFER_FROM_TENSOR(*X);
       cl_mem y = CL_BUFFER_FROM_TENSOR(*Y);
 
-      // DEV-ONLY (ORT_OPENCL_EXP=winoct): a stride-s transposed conv splits into s
-      // PHASE convs of ~K/s taps; here K == 2s, so each phase is exactly 2 taps --
-      // and a 2-tap filter is a 3-tap one with a zero third, so each phase runs the
-      // verified F(4,3) pipeline (NS=1) with its own pad and writes every os-th
-      // output element directly (no col2im). 6 multiplies / 4 outputs vs 8 for the
-      // direct 2-tap, i.e. 1.33x.
-      if (IsHalf(*X) && exec_->Exp().find("winoct") != std::string::npos &&
+      // A stride-s transposed conv splits into s PHASE convs of ~K/s taps; here
+      // K == 2s, so each phase is exactly 2 taps -- and a 2-tap filter is a 3-tap
+      // one with a zero third, so each phase runs the F(4,3) pipeline (NS=1) with
+      // its own pad and writes every os-th output element directly (no col2im).
+      // 6 multiplies / 4 outputs vs 8 for the direct 2-tap, i.e. 1.33x. Half-storage
+      // only. `ORT_OPENCL_EXP=nowino` forces the GEMM+col2im fallback (dev-only).
+      if (IsHalf(*X) && exec_->Exp().find("nowino") == std::string::npos &&
           stride > 1 && dilation == 1 && K == 2 * stride) {
         ORT_RETURN_IF_ERROR(WinogradCtPhases(wt, x, y, bias, has_bias, m_i, wout_i,
                                              c_i, w_i, k_i, static_cast<int>(stride),
