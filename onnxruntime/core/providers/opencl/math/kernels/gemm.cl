@@ -243,6 +243,7 @@ void Gemm_Tiled_F16(
 // and the result are half *in memory* -- the storage strategy of an fp16 graph
 // (and of LiteRT's GPU delegate). The fp32-storage F16 variant above converts each
 // element on load and on store; here the bytes moved are already half.
+__kernel __attribute__((reqd_work_group_size(GEMM_BN / GEMM_TN, GEMM_BM / GEMM_TM, 1)))
 void Gemm_Tiled_F16H(
     const int M,
     const int N,
