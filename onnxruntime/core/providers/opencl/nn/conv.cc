@@ -70,6 +70,7 @@ class Conv : public OpenCLKernel {
       // DEV-ONLY (ORT_OPENCL_EXP): see the variant selection in Compute().
       LoadKernel("Gemm_Tiled_Conv_H_TM8");
       LoadKernel("Gemm_Tiled_Conv_H_NG");
+      LoadKernel("Gemm_Tiled_Conv_H_PB");
     }
   }
 
@@ -180,6 +181,8 @@ class Conv : public OpenCLKernel {
           gtm = gtn = 8;
         } else if (h && exec_->Exp() == "conv_nogather") {
           exp_kernel = "Gemm_Tiled_Conv_H_NG";
+        } else if (h && exec_->Exp() == "conv_packb") {
+          exp_kernel = "Gemm_Tiled_Conv_H_PB";
         }
         const ConvTile tile = exp_kernel ? ConvTile{64, 64}
                                          : ChooseConvTile(m_i, wout_i, cap0, f16, h, a, x, y, bias,

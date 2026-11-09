@@ -271,7 +271,7 @@ DEFINE_GEMM_TILED_CONV_F16(Gemm_Tiled_Conv_BN32_F16, 64, 32, 32, 4, 4)
 // Half-*storage* twins: same tiles and half2 accumulate, but Wt/X/Y/B are half in
 // memory -- what an fp16 graph (and the GPU delegate) actually hands us. The F16
 // family above keeps fp32 storage and converts per element on load and store.
-#define DEFINE_GEMM_TILED_CONV_H(NAME, BM, BN, BK, TM, TN, NG)                  \
+#define DEFINE_GEMM_TILED_CONV_H(NAME, BM, BN, BK, TM, TN, NG, PB)             \
   __kernel __attribute__((reqd_work_group_size(BN / TN, BM / TM, 1)))           \
   void NAME(const int M, const int Wout, const int C, const int W,              \
             const int K, const int stride, const int pad, const int dil,        \
@@ -283,7 +283,13 @@ DEFINE_GEMM_TILED_CONV_F16(Gemm_Tiled_Conv_BN32_F16, 64, 32, 32, 4, 4)
     const int tid = ly * get_local_size(0) + lx;                                \
     const int nthreads = get_local_size(0) * get_local_size(1);                 \
     __local half As[BM][BK];                                                    \
-    __local half Bs[BK][BN];                                                    \
+    /* B is declared as half2 so a PB read is ONE 32-bit LDS op instead of two  */ \
+    /* 16-bit reads plus a pack; the scalar store path aliases it as half (the   */ \
+    /* same bytes, so the footprint is unchanged).                              */ \
+    __local half2 BsP[BK][BN / 2];                                              \
+    /* 2D half view of the same bytes, so the scalar store path still says      */ \
+    /* Bs[kk][j] and the base stays half2-aligned (4 bytes).                    */ \
+    __local half(*Bs)[BN] = (__local half(*)[BN])BsP;                           \
     const int row0 = get_group_id(1) * BM;                                      \
     const int Kdim = C * K;                                                     \
     half bias_r[TM];                                                            \
@@ -350,7 +356,7 @@ DEFINE_GEMM_TILED_CONV_F16(Gemm_Tiled_Conv_BN32_F16, 64, 32, 32, 4, 4)
           for (int i = 0; i < TM; ++i) a[i] = As[ly * TM + i][kk];              \
           for (int j2 = 0; j2 < TN / 2; ++j2) {                                 \
             const int jc = lx * TN + 2 * j2;                                    \
-            const half2 b2 = (half2)(Bs[kk][jc], Bs[kk][jc + 1]);               \
+            const half2 b2 = PB ? BsP[kk][jc / 2] : (half2)(Bs[kk][jc], Bs[kk][jc + 1]); \
             for (int i = 0; i < TM; ++i)                                        \
               acc2[i][j2] = (half2)(a[i], a[i]) * b2 + acc2[i][j2];             \
           }                                                                     \
@@ -386,15 +392,18 @@ DEFINE_GEMM_TILED_CONV_F16(Gemm_Tiled_Conv_BN32_F16, 64, 32, 32, 4, 4)
   }
 
 
-DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_H, 64, 64, 32, 4, 4, 0)
-DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_BM32_H, 32, 64, 32, 4, 4, 0)
-DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_BM16_H, 16, 64, 32, 4, 4, 0)
-DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_BN32_H, 64, 32, 32, 4, 4, 0)
+DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_H, 64, 64, 32, 4, 4, 0, 0)
+DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_BM32_H, 32, 64, 32, 4, 4, 0, 0)
+DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_BM16_H, 16, 64, 32, 4, 4, 0, 0)
+DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_BN32_H, 64, 32, 32, 4, 4, 0, 0)
 // DEV-ONLY experiment: the same tile with a larger register block (TM=TN=8, so a
 // 8x8 work-group and 4x the outputs per work-item). Selected by ORT_OPENCL_EXP so
 // the bench's paired A/B can run both in one process. NOT for the upstream series.
-DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_H_TM8, 64, 64, 32, 8, 8, 0)
+DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_H_TM8, 64, 64, 32, 8, 8, 0, 0)
 // DIAGNOSTIC (ORT_OPENCL_EXP=conv_nogather): contiguous read, WRONG output, to
 // price the strided im2col gather. Dev-only; never for the upstream series.
-DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_H_NG, 64, 64, 32, 4, 4, 1)
+DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_H_NG, 64, 64, 32, 4, 4, 1, 0)
+// A/B (ORT_OPENCL_EXP=conv_packb): read B as ONE packed half2 LDS op instead of
+// two 16-bit reads plus a pack (the per-FMA-overhead hypothesis). Dev-only.
+DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_H_PB, 64, 64, 32, 4, 4, 0, 1)
 #endif
