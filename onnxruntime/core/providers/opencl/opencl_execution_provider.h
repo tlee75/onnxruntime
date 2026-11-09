@@ -80,6 +80,15 @@ class OpenCLExecutionProvider : public IExecutionProvider {
   std::shared_ptr<KernelRegistry> GetKernelRegistry() const override;
   std::unique_ptr<onnxruntime::IDataTransfer> GetDataTransfer() const override;
 
+  /// The registry is built once and is device-independent, so it also advertises
+  /// the fp16 kernels on a device without cl_khr_fp16. Decline fp16 nodes there
+  /// rather than claim them and fail at kernel lookup (see the .cc).
+  std::vector<std::unique_ptr<ComputeCapability>>
+  GetCapability(const onnxruntime::GraphViewer& graph_viewer,
+                const IKernelLookup& kernel_lookup,
+                const GraphOptimizerRegistry& graph_optimizer_registry,
+                IResourceAccountant* resource_accountant = nullptr) const override;
+
   std::vector<AllocatorPtr> CreatePreferredAllocators() override;
 
   Status Sync() const override;
@@ -134,8 +143,11 @@ class OpenCLExecutionProvider : public IExecutionProvider {
   // Utility for other classes, kernel developer should not call them directly.
   // They are left as public to avoid friending those classes.
 
-  /// Whether fp16 is enabled. Used by Image2D allocator to decide the datatype
-  /// and OpenCLProgramManager to build kernels.
+  /// Whether the session asked for fp16 compute. This is the *reduced precision
+  /// on fp32 tensors* knob (like TensorRT's fp16_enable), NOT the fp16-graph
+  /// switch: an fp16 graph's kernels are selected by the tensor dtype and exist
+  /// whenever SupportsFp16() does. It only selects the reduced-precision kernel
+  /// variants (Gemm_Tiled_F16 and the fused-conv tiles) for float tensors.
 
   bool UseFp16() const { return use_fp16_; }
   int32_t TuneEnabledLevel() const { return auto_runing_level_; }

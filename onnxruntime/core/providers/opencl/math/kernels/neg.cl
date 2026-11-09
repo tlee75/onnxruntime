@@ -11,7 +11,8 @@ DEFINE_NEG_KERNEL(float, float)
 #if defined(cl_khr_fp64)
 DEFINE_NEG_KERNEL(double, double)
 #endif
-#ifdef USE_FP16
-#define cl_khr_fp16 1
+// fp16 kernels are a DEVICE capability (cl_khr_fp16), not a session choice:
+// an fp16 graph needs them whatever use_fp16 says.
+#if defined(cl_khr_fp16)
 DEFINE_NEG_KERNEL(half, fp16)
 #endif

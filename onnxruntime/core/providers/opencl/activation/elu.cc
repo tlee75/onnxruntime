@@ -24,7 +24,7 @@ class Elu : public OpenCLKernel {
     info.GetAttrOrDefault<float>("alpha", &alpha_, 1.0f);
     LoadProgram(elu_kernel_src, elu_kernel_src_len);
     LoadKernel("Elu_Float");
-    if (exec_->SupportsFp16() && exec_->UseFp16()) LoadKernel("Elu_Half");
+    if (exec_->SupportsFp16()) LoadKernel("Elu_Half");
   }
 
   Status Compute(OpKernelContext* context) const override {
@@ -37,8 +37,8 @@ class Elu : public OpenCLKernel {
     ORT_ENFORCE(input_size < std::numeric_limits<std::ptrdiff_t>::max());
 
     // Pick the kernel by the tensor's own dtype: an fp16 graph hands us half
-    // buffers regardless of the session's use_fp16 (which only selects the prelude
-    // and the GEMM tile variants).
+    // buffers regardless of the session's use_fp16 (which only selects the
+    // reduced-precision variants for fp32 tensors).
     const bool f16 = X->DataType() == DataTypeImpl::GetTensorType<MLFloat16>();
     const char* kn = f16 ? "Elu_Half" : "Elu_Float";
 
