@@ -204,11 +204,14 @@ class Conv : public OpenCLKernel {
           }
           LOGS_DEFAULT(WARNING) << "[CL] image2d path unavailable; using buffers";
         }
-        // DEV-ONLY (ORT_OPENCL_EXP=winograd): 1D Winograd F(4,3) for the 3-tap
-        // stride-1 convs (the graph's 3x3 Convs have pads=[2,0], i.e. pad_l == 2).
-        if (h && exec_->Exp() == "winograd" && k_i == 3 && stride == 1 && dilation == 1 &&
-            pad_l == 2 && (wout_i % 4) == 0 && m_i > 0 && c_i > 0) {
-          ORT_RETURN_IF_ERROR(WinogradConv(a, x, y, bias, m_i, wout_i, c_i, w_i, has_bias));
+        // DEV-ONLY (ORT_OPENCL_EXP=winograd): 1D Winograd F(4,3) for any stride-1
+        // k>=3 conv, decomposed into ceil(K/3) 3-tap slices stacked along the
+        // reduction (K=3 is one slice, K=7 is three). Any pad works: slice s's
+        // window starts at 4j - pad + 3s.
+        if (h && exec_->Exp() == "winograd" && k_i >= 3 && stride == 1 && dilation == 1 &&
+            (wout_i % 4) == 0 && m_i > 0 && c_i > 0) {
+          ORT_RETURN_IF_ERROR(WinogradConv(a, x, y, bias, m_i, wout_i, c_i, w_i, k_i,
+                                           static_cast<int>(pad_l), has_bias));
           return Status::OK();
         }
         // DEV-ONLY A/B variants selected by ORT_OPENCL_EXP; both are half-storage and
@@ -437,19 +440,25 @@ class Conv : public OpenCLKernel {
     return img_;
   }
 
-  /// DEV-ONLY (ORT_OPENCL_EXP=winograd): the 1D F(4,3) path for a 3-tap stride-1
-  /// conv with pad_l == 2. The transformed weights U depend only on the shape, so
-  /// they are built once and cached; V (input tiles) and P (transform-domain
-  /// products) are cached per (M, C, T) and rebuilt each call. The six
-  /// transform-domain GEMMs reduce over C instead of C*3 -- that is the win.
+  /// DEV-ONLY (ORT_OPENCL_EXP=winograd): the 1D F(4,3) path for any stride-1 k>=3
+  /// conv, as ceil(K/3) 3-tap slices stacked along the reduction (K=3 -> 1 slice,
+  /// K=7 -> 3). The transformed weights U depend only on the shape, so they are
+  /// built once and cached; V (input tiles) and P (transform-domain products) are
+  /// cached per (M, C, T, NS) and rebuilt each call. The six transform-domain GEMMs
+  /// reduce over NS*C instead of over C*K -- that is the win.
   Status WinogradConv(cl_mem wt, cl_mem x, cl_mem y, cl_mem bias,
-                      int m_i, int wout_i, int c_i, int w_i, int has_bias) const {
+                      int m_i, int wout_i, int c_i, int w_i, int k_i, int pad_l,
+                      int has_bias) const {
     const int T = wout_i / 4;
-    const size_t u_sz = static_cast<size_t>(m_i) * static_cast<size_t>(c_i) * sizeof(cl_half);
-    const size_t v_sz = static_cast<size_t>(c_i) * static_cast<size_t>(T) * sizeof(cl_half);
+    // ceil(K/3) 3-tap slices, stacked along the reduction: the transform-domain
+    // GEMM then reduces over NS*C instead of over C*K.
+    const int NS = (k_i + 2) / 3;
+    const size_t nc = static_cast<size_t>(NS) * static_cast<size_t>(c_i);
+    const size_t u_sz = static_cast<size_t>(m_i) * nc * sizeof(cl_half);
+    const size_t v_sz = nc * static_cast<size_t>(T) * sizeof(cl_half);
     const size_t p_sz = static_cast<size_t>(m_i) * static_cast<size_t>(T) * sizeof(cl_half);
     std::lock_guard<std::mutex> guard(wino_mu_);
-    if (wino_m_ != m_i || wino_c_ != c_i || wino_t_ != T) {
+    if (wino_m_ != m_i || wino_c_ != c_i || wino_t_ != T || wino_ns_ != NS) {
       cl_mem* sets[3] = {wino_u_, wino_v_, wino_p_};
       for (cl_mem* arr : sets) {
         for (int t = 0; t < 6; ++t) {
@@ -468,15 +477,18 @@ class Conv : public OpenCLKernel {
       wino_m_ = m_i;
       wino_c_ = c_i;
       wino_t_ = T;
+      wino_ns_ = NS;
       for (int t = 0; t < 6; ++t) {
         ORT_RETURN_IF_ERROR(
             KernelLauncher{GetKernel("WinoWeightT")}
                 .SetBuffer(wt)
                 .SetArg<cl_int>(m_i)
                 .SetArg<cl_int>(c_i)
+                .SetArg<cl_int>(k_i)
+                .SetArg<cl_int>(NS)
                 .SetArg<cl_int>(t)
                 .SetBuffer(wino_u_[t])
-                .Launch(*exec_, NDRange(static_cast<size_t>(c_i), static_cast<size_t>(m_i))));
+                .Launch(*exec_, NDRange(nc, static_cast<size_t>(m_i))));
       }
     }
     for (int t = 0; t < 6; ++t) {
@@ -485,11 +497,12 @@ class Conv : public OpenCLKernel {
               .SetBuffer(x)
               .SetArg<cl_int>(c_i)
               .SetArg<cl_int>(w_i)
-              .SetArg<cl_int>(2)
+              .SetArg<cl_int>(NS)
+              .SetArg<cl_int>(pad_l)
               .SetArg<cl_int>(T)
               .SetArg<cl_int>(t)
               .SetBuffer(wino_v_[t])
-              .Launch(*exec_, NDRange(static_cast<size_t>(T), static_cast<size_t>(c_i))));
+              .Launch(*exec_, NDRange(static_cast<size_t>(T), nc)));
     }
     const size_t lx = 16;  // Gemm_Tiled_F16H work-group: GEMM_BN / GEMM_TN
     const size_t ly = 16;  //                             GEMM_BM / GEMM_TM
@@ -502,7 +515,7 @@ class Conv : public OpenCLKernel {
           KernelLauncher{GetKernel("Gemm_Tiled_F16H")}
               .SetArg<cl_int>(m_i)
               .SetArg<cl_int>(T)
-              .SetArg<cl_int>(c_i)
+              .SetArg<cl_int>(static_cast<cl_int>(nc))
               .SetArg<cl_int>(0)  // bias is applied by WinoOutputT
               .SetArg<cl_int>(0)  // trans_a: U is [M, C]
               .SetBuffer(wino_u_[t])
@@ -538,6 +551,7 @@ class Conv : public OpenCLKernel {
   mutable int wino_m_ = 0;
   mutable int wino_c_ = 0;
   mutable int wino_t_ = 0;
+  mutable int wino_ns_ = 0;
 };
 
 ONNX_OPENCL_OPERATOR_KERNEL(

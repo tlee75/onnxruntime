@@ -530,12 +530,17 @@ __kernel void ImgFillX(__global const half* X, const int C, const int W,
 //   P[t]       = U[t] @ V[t]                          (Gemm_Tiled_F16H, K = C)
 //   Y[m][4j+q] = bias[m] + sum_t At[q][t] * P[t][m][j]
 __kernel void WinoWeightT(__global const half* Wt, const int M, const int C,
-                          const int t, __global half* U_t) {
+                          const int K, const int NS, const int t, __global half* U_t) {
+  const int row = get_global_id(0);  // s*C + c
   const int m = get_global_id(1);
-  const int c = get_global_id(0);
-  if (m >= M || c >= C) return;
-  const int b = m * (C * 3) + c * 3;
-  const float g0 = (float)Wt[b], g1 = (float)Wt[b + 1], g2 = (float)Wt[b + 2];
+  const int NC = NS * C;
+  if (m >= M || row >= NC) return;
+  const int s = row / C;
+  const int c = row - s * C;
+  const int b = m * (C * K) + c * K + 3 * s;
+  const float g0 = (3 * s + 0 < K) ? (float)Wt[b] : 0.0f;
+  const float g1 = (3 * s + 1 < K) ? (float)Wt[b + 1] : 0.0f;
+  const float g2 = (3 * s + 2 < K) ? (float)Wt[b + 2] : 0.0f;
   float u;
   if (t == 0) u = 0.25f * g0;
   else if (t == 1) u = -(g0 + g1 + g2) / 6.0f;
@@ -543,15 +548,19 @@ __kernel void WinoWeightT(__global const half* Wt, const int M, const int C,
   else if (t == 3) u = g0 / 24.0f + g1 / 12.0f + g2 / 6.0f;
   else if (t == 4) u = g0 / 24.0f - g1 / 12.0f + g2 / 6.0f;
   else u = g2;
-  U_t[m * C + c] = (half)u;
+  U_t[m * NC + row] = (half)u;
 }
 
 __kernel void WinoInputT(__global const half* X, const int C, const int W,
-                         const int pad, const int T, const int t, __global half* V_t) {
+                         const int NS, const int pad, const int T, const int t,
+                         __global half* V_t) {
   const int j = get_global_id(0);
-  const int c = get_global_id(1);
-  if (j >= T || c >= C) return;
-  const int base = 4 * j - pad;
+  const int row = get_global_id(1);  // s*C + c
+  const int NC = NS * C;
+  if (j >= T || row >= NC) return;
+  const int s = row / C;
+  const int c = row - s * C;
+  const int base = 4 * j - pad + 3 * s;
   float d[6];
   for (int r = 0; r < 6; ++r) {
     const int iw = base + r;
@@ -564,7 +573,7 @@ __kernel void WinoInputT(__global const half* X, const int C, const int W,
   else if (t == 3) v = -2.0f * d[1] - d[2] + 2.0f * d[3] + d[4];
   else if (t == 4) v = 2.0f * d[1] - d[2] - 2.0f * d[3] + d[4];
   else v = 4.0f * d[1] - 5.0f * d[3] + d[5];
-  V_t[c * T + j] = (half)v;
+  V_t[row * T + j] = (half)v;
 }
 
 __kernel void WinoOutputT(__global const half* P0, __global const half* P1,
