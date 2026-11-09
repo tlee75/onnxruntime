@@ -10,3 +10,14 @@ __kernel void Elu_Float(
   float v = input[global_id];
   output[global_id] = v > 0.0f ? v : alpha * (exp(v) - 1.0f);
 }
+
+// fp16 twin: an fp16 graph's tensors are half, so the elementwise ops need
+// half-buffer kernels (the activations are what dominate the fp16 tensor traffic).
+__kernel void Elu_Half(
+    __global const half* input,
+    __global half* output,
+    const float alpha) {
+  int global_id = get_global_id(0);
+  const half v = input[global_id];
+  output[global_id] = v > (half)0 ? v : (half)(alpha * (exp((float)v) - 1.0f));
+}
