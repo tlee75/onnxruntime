@@ -271,7 +271,7 @@ DEFINE_GEMM_TILED_CONV_F16(Gemm_Tiled_Conv_BN32_F16, 64, 32, 32, 4, 4)
 // Half-*storage* twins: same tiles and half2 accumulate, but Wt/X/Y/B are half in
 // memory -- what an fp16 graph (and the GPU delegate) actually hands us. The F16
 // family above keeps fp32 storage and converts per element on load and store.
-#define DEFINE_GEMM_TILED_CONV_H(NAME, BM, BN, BK, TM, TN)                     \
+#define DEFINE_GEMM_TILED_CONV_H(NAME, BM, BN, BK, TM, TN)                    \
   __kernel __attribute__((reqd_work_group_size(BN / TN, BM / TM, 1)))           \
   void NAME(const int M, const int Wout, const int C, const int W,              \
             const int K, const int stride, const int pad, const int dil,        \
@@ -328,14 +328,14 @@ DEFINE_GEMM_TILED_CONV_F16(Gemm_Tiled_Conv_BN32_F16, 64, 32, 32, 4, 4)
           const int j = idx % BN;                                               \
           const int gk = k0 + kk;                                               \
           const int ow = col0 + j;                                              \
-          half v = (half)0;                                                       \
+          half v = (half)0;                                                     \
           if (gk < Kdim && ow < Wout) {                                         \
             const int c = gk / K;                                               \
             const int tap = gk - c * K;                                         \
             const int iw = ow * stride - pad + tap * dil;                       \
             if (iw >= 0 && iw < W) v = X[c * W + iw];                           \
           }                                                                     \
-          Bs[kk][j] = v;                                                  \
+          Bs[kk][j] = v;                                                        \
         }                                                                       \
         barrier(CLK_LOCAL_MEM_FENCE);                                           \
         for (int kk = 0; kk < BK; ++kk) {                                       \
@@ -343,7 +343,7 @@ DEFINE_GEMM_TILED_CONV_F16(Gemm_Tiled_Conv_BN32_F16, 64, 32, 32, 4, 4)
           for (int i = 0; i < TM; ++i) a[i] = As[ly * TM + i][kk];              \
           for (int j2 = 0; j2 < TN / 2; ++j2) {                                 \
             const int jc = lx * TN + 2 * j2;                                    \
-            const half2 b2 = (half2)(Bs[kk][jc], Bs[kk][jc + 1]);               \
+            const half2 b2 = (half2)(Bs[kk][jc], Bs[kk][jc + 1]);              \
             for (int i = 0; i < TM; ++i)                                        \
               acc2[i][j2] = (half2)(a[i], a[i]) * b2 + acc2[i][j2];             \
           }                                                                     \
@@ -383,4 +383,8 @@ DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_H, 64, 64, 32, 4, 4)
 DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_BM32_H, 32, 64, 32, 4, 4)
 DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_BM16_H, 16, 64, 32, 4, 4)
 DEFINE_GEMM_TILED_CONV_H(Gemm_Tiled_Conv_BN32_H, 64, 32, 32, 4, 4)
+
+// The Winograd F(4,3) transforms (WinoWeightT / WinoInputT6 / WinoOutputT /
+// WinoCtGather) live in math/kernels/gemm.cl, which conv.cl and convtranspose.cl
+// both include.
 #endif

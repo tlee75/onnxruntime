@@ -79,7 +79,14 @@ void Gemm_Tiled(
     __global const float* A,
     __global const float* B,
     __global float* C,
-    __global const float* Bias) {
+    __global const float* Bias,
+    const int sa, const int sb, const int sc) {
+  // Batching (used by the Winograd paths): plane p = get_group_id(2) selects the
+  // p-th operand plane. The plain 2-D grid is plane 0 with zero offsets.
+  const int plane = get_group_id(2);
+  A += (size_t)plane * sa;
+  B += (size_t)plane * sb;
+  C += (size_t)plane * sc;
   const int lx = get_local_id(0);  // N dimension
   const int ly = get_local_id(1);  // M dimension
   const int tid = ly * get_local_size(0) + lx;
@@ -168,7 +175,12 @@ void Gemm_Tiled_F16(
     __global const float* A,
     __global const float* B,
     __global float* C,
-    __global const float* Bias) {
+    __global const float* Bias,
+    const int sa, const int sb, const int sc) {
+  const int plane = get_group_id(2);
+  A += (size_t)plane * sa;
+  B += (size_t)plane * sb;
+  C += (size_t)plane * sc;
   const int lx = get_local_id(0);
   const int ly = get_local_id(1);
   const int tid = ly * get_local_size(0) + lx;
@@ -253,7 +265,16 @@ void Gemm_Tiled_F16H(
     __global const half* A,
     __global const half* B,
     __global half* C,
-    __global const half* Bias) {
+    __global const half* Bias,
+    const int sa, const int sb, const int sc) {
+  // Plane batching (used by the Winograd paths): plane p = get_group_id(2)
+  // selects the p-th operand plane, so ONE launch covers all six F(4,3) transform
+  // points and gets a 6x bigger grid. A 2D grid means plane 0 and zero offsets,
+  // i.e. the plain GEMM.
+  const int plane = get_group_id(2);
+  A += (size_t)plane * sa;
+  B += (size_t)plane * sb;
+  C += (size_t)plane * sc;
   const int lx = get_local_id(0);
   const int ly = get_local_id(1);
   const int tid = ly * get_local_size(0) + lx;
@@ -407,5 +428,123 @@ void Gemm_Tiled_F16H(
     }
     barrier(CLK_LOCAL_MEM_FENCE);
   }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// The 1D Winograd F(4,3) transforms (U/V/P and the ConvTranspose phase gather).
+// They live in gemm.cl because BOTH conv.cl and convtranspose.cl include this
+// file, so one definition serves both programs.
+//
+//   U[t][m][row] = sum_rr G[t][rr] * W[m][row*3 + rr]        (weights, computed once)
+//   V[t][row][j] = sum_rr Bt[t][rr] * X[c][4j - pad + 3s + rr]
+//   P[t]         = U[t] @ V[t]                               (Gemm_Tiled_F16H)
+//   Y[m][os*(4j+q)+r] = bias[m] + sum_t At[q][t] * P[t][m][j]
+// with row = s*C + c, s in [0, NS) a 3-tap slice of the original kernel (K=3 is
+// NS=1, K=7 is NS=3 with the third slice zero-padded; a ConvTranspose PHASE is
+// NS=1 with two real taps and a zero third).
+#if defined(cl_khr_fp16)
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+
+__kernel void WinoWeightT(__global const half* Wt, const int M, const int C,
+                          const int K, const int NS, const int t,
+                          const int u_stride, __global half* U) {
+  const int row = get_global_id(0);  // s*C + c
+  const int m = get_global_id(1);
+  const int NC = NS * C;
+  if (m >= M || row >= NC) return;
+  const int s = row / C;
+  const int c = row - s * C;
+  const int b = m * (C * K) + c * K + 3 * s;
+  const float g0 = (3 * s + 0 < K) ? (float)Wt[b] : 0.0f;
+  const float g1 = (3 * s + 1 < K) ? (float)Wt[b + 1] : 0.0f;
+  const float g2 = (3 * s + 2 < K) ? (float)Wt[b + 2] : 0.0f;
+  float u;
+  if (t == 0) u = 0.25f * g0;
+  else if (t == 1) u = -(g0 + g1 + g2) / 6.0f;
+  else if (t == 2) u = (-g0 + g1 - g2) / 6.0f;
+  else if (t == 3) u = g0 / 24.0f + g1 / 12.0f + g2 / 6.0f;
+  else if (t == 4) u = g0 / 24.0f - g1 / 12.0f + g2 / 6.0f;
+  else u = g2;
+  U[t * u_stride + m * NC + row] = (half)u;
+}
+
+
+// The input transform: all six transform points in ONE launch. Each work-item
+// reads its 6-tap window once and emits all six planes; a per-point form (six
+// launches, re-reading the window and recomputing d[] each time) reads X ~6x more
+// than the data warrants, which is why this fused form is the one that ships.
+__kernel void WinoInputT6(__global const half* X, const int C, const int W,
+                          const int NS, const int pad, const int T,
+                          const int v_stride, __global half* V) {
+  const int j = get_global_id(0);
+  const int row = get_global_id(1);  // s*C + c
+  const int NC = NS * C;
+  if (j >= T || row >= NC) return;
+  const int s = row / C;
+  const int c = row - s * C;
+  const int base = 4 * j - pad + 3 * s;
+  float d[6];
+#pragma unroll
+  for (int r = 0; r < 6; ++r) {
+    const int iw = base + r;
+    d[r] = (iw >= 0 && iw < W) ? (float)X[c * W + iw] : 0.0f;
+  }
+  const int o = row * T + j;
+  V[0 * v_stride + o] = (half)(4.0f * d[0] - 5.0f * d[2] + d[4]);
+  V[1 * v_stride + o] = (half)(-4.0f * d[1] - 4.0f * d[2] + d[3] + d[4]);
+  V[2 * v_stride + o] = (half)(4.0f * d[1] - 4.0f * d[2] - d[3] + d[4]);
+  V[3 * v_stride + o] = (half)(-2.0f * d[1] - d[2] + 2.0f * d[3] + d[4]);
+  V[4 * v_stride + o] = (half)(2.0f * d[1] - d[2] - 2.0f * d[3] + d[4]);
+  V[5 * v_stride + o] = (half)(4.0f * d[1] - 5.0f * d[3] + d[5]);
+}
+
+// os/r place the tile in the output: os=1,r=0 for a plain Conv, and os=stride,
+// r=phase for a ConvTranspose phase (which writes every os-th element). P holds
+// the six transform planes back to back, p_stride apart.
+__kernel void WinoOutputT(__global const half* P, const int p_stride,
+                          const int M, const int T, const int has_bias,
+                          __global const half* B, __global half* Y, const int Wout,
+                          const int os, const int r) {
+  const int j = get_global_id(0);
+  const int m = get_global_id(1);
+  if (j >= T || m >= M) return;
+  const int o = m * T + j;
+  const float p0 = (float)P[0 * p_stride + o], p1 = (float)P[1 * p_stride + o];
+  const float p2 = (float)P[2 * p_stride + o], p3 = (float)P[3 * p_stride + o];
+  const float p4 = (float)P[4 * p_stride + o], p5 = (float)P[5 * p_stride + o];
+  const float bias = has_bias ? (float)B[m] : 0.0f;
+  const float y0 = p0 + p1 + p2 + p3 + p4;
+  const float y1 = p1 - p2 + 2.0f * p3 - 2.0f * p4;
+  const float y2 = p1 + p2 + 4.0f * p3 + 4.0f * p4;
+  const float y3 = p1 - p2 + 8.0f * p3 - 8.0f * p4 + p5;
+  const int q0 = 4 * j;
+  const int ow0 = os * q0 + r;
+  if (ow0 < Wout) Y[m * Wout + ow0] = (half)(y0 + bias);
+  if (os * (q0 + 1) + r < Wout) Y[m * Wout + os * (q0 + 1) + r] = (half)(y1 + bias);
+  if (os * (q0 + 2) + r < Wout) Y[m * Wout + os * (q0 + 2) + r] = (half)(y2 + bias);
+  if (os * (q0 + 3) + r < Wout) Y[m * Wout + os * (q0 + 3) + r] = (half)(y3 + bias);
+}
+
+// Gather ONE ConvTranspose phase's two taps --
+// k0 = (r+pad) mod s and k0+s of the [C][M*K] weight -- into a [M][C][3] filter
+// [w(k0+s), w(k0), 0] that the F(4,3) pipeline can consume. The phase window
+// starts at 4q + a0 with a0 = (r + pad - k0)/s, so as a 3-tap correlation its pad
+// is 1 - a0.
+__kernel void WinoCtGather(__global const half* Wt, const int M, const int C,
+                           const int K, const int s, const int k0,
+                           __global half* Wp) {
+  const int c = get_global_id(0);
+  const int m = get_global_id(1);
+  if (m >= M || c >= C) return;
+  const int base = c * (M * K) + m * K + k0;
+  // g[0] multiplies x[q + a0 - 1], which comes from tap k0+s; g[1] multiplies
+  // x[q + a0], from tap k0 (pad3 = 1 - a0 puts those at rr = 0 and 1).
+  const float g0 = (k0 + s < K) ? (float)Wt[base + s] : 0.0f;  // tap k0+s
+  const float g1 = (k0 < K) ? (float)Wt[base] : 0.0f;          // tap k0
+  const int o = (m * C + c) * 3;
+  Wp[o + 0] = (half)g0;
+  Wp[o + 1] = (half)g1;
+  Wp[o + 2] = (half)0;
 }
 #endif
