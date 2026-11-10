@@ -21,7 +21,9 @@ class Range : public OpenCLKernel {
     LoadKernel("Range_float");
     LoadKernel("Range_int");
     LoadKernel("Range_long");
-    LoadKernel("Range_double");
+    if (exec_->SupportsFp64()) {
+      LoadKernel("Range_double");
+    }
   }
 
   Status Compute(OpKernelContext* context) const override;

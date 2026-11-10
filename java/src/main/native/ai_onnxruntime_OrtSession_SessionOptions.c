@@ -21,6 +21,7 @@
 #include "onnxruntime/core/providers/tvm/tvm_provider_factory.h"
 #include "onnxruntime/core/providers/openvino/openvino_provider_factory.h"
 #include "onnxruntime/core/providers/acl/acl_provider_factory.h"
+#include "onnxruntime/core/providers/opencl/opencl_provider_factory.h"
 #include "onnxruntime/core/providers/armnn/armnn_provider_factory.h"
 #include "onnxruntime/core/providers/coreml/coreml_provider_factory.h"
 #ifdef USE_DML
@@ -666,6 +667,23 @@ JNIEXPORT void JNICALL Java_ai_onnxruntime_OrtSession_00024SessionOptions_addACL
   #else
     (void)apiHandle;(void)handle;(void)enableFastMath; // Parameters used when ACL is defined.
     throwOrtException(jniEnv,convertErrorCode(ORT_INVALID_ARGUMENT),"This binary was not compiled with ACL support.");
+  #endif
+}
+
+/*
+ * Class:     ai_onnxruntime_OrtSession_SessionOptions
+ * Method:    addOpenCL
+ * Signature: (JJZZ)V
+ */
+JNIEXPORT void JNICALL Java_ai_onnxruntime_OrtSession_00024SessionOptions_addOpenCL
+  (JNIEnv * jniEnv, jobject jobj, jlong apiHandle, jlong handle, jboolean useFp16, jboolean enableAutoTune) {
+  (void)jobj;
+  #ifdef USE_OPENCL
+    checkOrtStatus(jniEnv,(const OrtApi*)apiHandle,
+      OrtSessionOptionsAppendExecutionProvider_OpenCL((OrtSessionOptions*) handle, useFp16, enableAutoTune));
+  #else
+    (void)apiHandle;(void)handle;(void)useFp16;(void)enableAutoTune; // Parameters used when OpenCL is defined.
+    throwOrtException(jniEnv,convertErrorCode(ORT_INVALID_ARGUMENT),"This binary was not compiled with OpenCL support.");
   #endif
 }
 

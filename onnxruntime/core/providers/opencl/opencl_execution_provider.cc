@@ -11,6 +11,8 @@
 #include "core/framework/op_kernel.h"
 
 #include <array>
+#include <string>
+#include <unordered_set>
 #include <utility>
 
 // Add includes of kernel implementations
@@ -25,6 +27,11 @@
 #include "core/providers/opencl/generator/generator.h"
 #include "core/providers/opencl/math/trigonometric.h"
 #include "core/providers/opencl/math/Neg.h"
+#include "core/providers/opencl/activation/relu.h"
+#include "core/providers/opencl/math/exp.h"
+#include "core/providers/opencl/nn/conv.h"
+#include "core/providers/opencl/nn/convtranspose.h"
+#include "core/providers/opencl/tensor/pad.h"
 
 namespace onnxruntime {
 namespace opencl {
@@ -52,6 +59,13 @@ Status RegisterOpenCLKernels(KernelRegistry& kernel_registry) {
       BuildKernelCreateInfo<ONNX_OPERATOR_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 7, Sin)>,
       BuildKernelCreateInfo<ONNX_OPERATOR_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 13, Neg)>,
       BuildKernelCreateInfo<ONNX_OPERATOR_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 14, Trilu)>,
+
+      // Vocoder ops (docs: the SEANet decoder needs conv/deconv + relu/exp/pad).
+      BuildKernelCreateInfo<ONNX_OPERATOR_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 14, Relu)>,
+      BuildKernelCreateInfo<ONNX_OPERATOR_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 13, Exp)>,
+      BuildKernelCreateInfo<ONNX_OPERATOR_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 11, Conv)>,
+      BuildKernelCreateInfo<ONNX_OPERATOR_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 11, ConvTranspose)>,
+      BuildKernelCreateInfo<ONNX_OPERATOR_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 13, Pad)>,
 
       BuildKernelCreateInfo<ONNX_OPERATOR_VERSIONED_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 13, 13, Reshape)>,
       BuildKernelCreateInfo<ONNX_OPERATOR_VERSIONED_KERNEL_CLASS_NAME(kOpenCLExecutionProvider, kOnnxDomain, 14, 18, Reshape)>,
@@ -146,7 +160,7 @@ Status RegisterOpenCLKernels(KernelRegistry& kernel_registry) {
 
   for (auto& function_table_entry : function_table) {
     KernelCreateInfo info = function_table_entry();
-    if (info.kernel_def != nullptr) {  // filter disabled entries where type is void
+    if (info.kernel_def != nullptr) {
       VLOGS_DEFAULT(V_GENERIC) << "Register kernel name: " << info.kernel_def->OpName()
                                << ", domain: " << info.kernel_def->Domain();
       ORT_RETURN_IF_ERROR(kernel_registry.Register(std::move(info)));

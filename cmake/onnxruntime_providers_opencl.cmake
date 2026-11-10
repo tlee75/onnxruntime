@@ -80,20 +80,21 @@ if (onnxruntime_USE_OPENCL)
     LINKER_LANGUAGE CXX
     FOLDER "ONNXRuntime"
   )
+  # This is a draft, unmerged EP; modern clang adds warnings it was not written
+  # for. Do not treat the provider's warnings as errors.
+  set_target_properties(onnxruntime_providers_opencl PROPERTIES COMPILE_WARNING_AS_ERROR OFF)
+  target_compile_options(onnxruntime_providers_opencl PRIVATE "-Wno-error")
   target_compile_options(onnxruntime_providers_opencl PRIVATE "-Wno-error=unused-parameter")
   target_compile_options(onnxruntime_providers_opencl PRIVATE "-Wno-error=unused-variable")
   target_compile_options(onnxruntime_providers_opencl PRIVATE "-Wno-error=return-type")
 
 
-  if(CMAKE_SYSTEM_NAME STREQUAL "Android")
-    # No supported now
-    # add_subdirectory(${PROJECT_SOURCE_DIR}/external/cl3w)
-    # target_link_libraries(onnxruntime_providers_opencl PUBLIC cl3w)
-  else()
-    find_package(OpenCL REQUIRED)
-    target_compile_definitions(onnxruntime_providers_opencl PUBLIC "CL_TARGET_OPENCL_VERSION=120")
-    target_link_libraries(onnxruntime_providers_opencl PUBLIC OpenCL::OpenCL)
-  endif()
+  # Android links OpenCL directly against the device's libOpenCL (Mali). The
+  # upstream branch disabled this ("No supported now"); we enable it and pass
+  # OpenCL_INCLUDE_DIR/OpenCL_LIBRARY from the build (NDK ships neither).
+  find_package(OpenCL REQUIRED)
+  target_compile_definitions(onnxruntime_providers_opencl PUBLIC "CL_TARGET_OPENCL_VERSION=120")
+  target_link_libraries(onnxruntime_providers_opencl PUBLIC OpenCL::OpenCL)
   onnxruntime_add_include_to_target(onnxruntime_providers_opencl onnxruntime_common onnxruntime_framework onnx onnx_proto ${PROTOBUF_LIB}
   flatbuffers Boost::mp11 ${GSL_TARGET} date::date onnxruntime_util safeint_interface Eigen3::Eigen)
   add_dependencies(onnxruntime_providers_opencl onnxruntime_providers gen_opencl_embed_hdrs)

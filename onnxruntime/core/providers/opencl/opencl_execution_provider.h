@@ -87,6 +87,15 @@ class OpenCLExecutionProvider : public IExecutionProvider {
   cl_command_queue GetCommandQueue() const { return cmd_queue_; }
   cl_command_queue GetCommandQueueForTune() const { return cmd_tune_queue_; }
 
+  /// True when the device/compiler supports fp64 (CL_DEVICE_DOUBLE_FP_CONFIG
+  /// nonzero, i.e. cl_khr_fp64). Mobile GPUs (e.g. Mali) do not, and their
+  /// compilers reject any `double` — the kernels guard those with cl_khr_fp64.
+  bool SupportsFp64() const {
+    cl_device_fp_config cfg = 0;
+    clGetDeviceInfo(dev_, CL_DEVICE_DOUBLE_FP_CONFIG, sizeof(cfg), &cfg, nullptr);
+    return cfg != 0;
+  }
+
   // /// Get an OpenCL Buffer for temporary usage from Buffer allocator.
   cl_mem GetScratchBufferTmp(size_t nbytes) const;
   void WriteToCLBuffer(cl_mem buffer, const void* host_ptr, size_t nbytes);

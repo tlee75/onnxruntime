@@ -35,7 +35,9 @@
 DEFINE_GREATER_KERNEL(float, float)
 
 // 定义 double 类型的 greater kernel
+#if defined(cl_khr_fp64)
 DEFINE_GREATER_KERNEL(double, double)
+#endif
 
 #ifdef USE_FP16
 // 定义 half 类型的 greater kernel

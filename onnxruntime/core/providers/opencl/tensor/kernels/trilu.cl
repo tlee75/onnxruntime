@@ -38,6 +38,7 @@ __kernel void Trilu_float(__global float* input,
   }
 }
 
+#if defined(cl_khr_fp64)
 __kernel void Trilu_double(__global double* input,
                            __global double* output,
                            __global long* shape,
@@ -77,3 +78,4 @@ __kernel void Trilu_double(__global double* input,
     }
   }
 }
+#endif

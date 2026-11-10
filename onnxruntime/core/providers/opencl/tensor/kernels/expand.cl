@@ -31,7 +31,9 @@
   }
 
 DEFINE_EXPAND_KERNEL(float, expand_float);
+#if defined(cl_khr_fp64)
 DEFINE_EXPAND_KERNEL(double, expand_double);
+#endif
 DEFINE_EXPAND_KERNEL(int, expand_int);
 DEFINE_EXPAND_KERNEL(long, expand_long);
 DEFINE_EXPAND_KERNEL(uint, expand_uint);

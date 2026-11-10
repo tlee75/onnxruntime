@@ -130,6 +130,9 @@ cl_program OpenCLProgramManager::GetProgram(std::string_view src_body) {
 }
 
 void OpenCLProgramManager::ReleaseProgram(cl_program program) {
+  if (program == nullptr) {
+    return;
+  }
   auto rc = DerefProgram(program);
   if (rc == 0) {
     EvictProgram(program);

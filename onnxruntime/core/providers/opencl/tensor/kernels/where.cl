@@ -43,4 +43,6 @@ DEFINE_OP_KERNEL(int, where_int)
 
 DEFINE_OP_KERNEL(long, where_long)
 
+#if defined(cl_khr_fp64)
 DEFINE_OP_KERNEL(double, where_double)
+#endif

@@ -62,7 +62,7 @@ class OpenCLKernelHolder {
 
  private:
   OpenCLProgramManager* mgr_;
-  cl_program program_;
+  cl_program program_ = nullptr;
   std::unordered_map<std::string, cl_kernel> kernels_;
 };
 

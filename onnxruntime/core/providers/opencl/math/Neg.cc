@@ -20,7 +20,9 @@ class neg : public OpenCLKernel {
   explicit neg(const OpKernelInfo& info) : OpenCLKernel(info) {
     LoadProgram(neg_kernel_src, neg_kernel_src_len);
     LoadKernel("neg_float");
-    LoadKernel("neg_double");
+    if (exec_->SupportsFp64()) {
+      LoadKernel("neg_double");
+    }
     // LoadKernel("neg_fp16");
   }
 

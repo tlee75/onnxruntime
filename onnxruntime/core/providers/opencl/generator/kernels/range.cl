@@ -6,4 +6,6 @@
 DEFINE_RANGE_KERNEL(int)
 DEFINE_RANGE_KERNEL(float)
 DEFINE_RANGE_KERNEL(long)
+#if defined(cl_khr_fp64)
 DEFINE_RANGE_KERNEL(double)
+#endif

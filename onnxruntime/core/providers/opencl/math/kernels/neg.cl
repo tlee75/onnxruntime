@@ -8,7 +8,9 @@
   }
 
 DEFINE_NEG_KERNEL(float, float)
+#if defined(cl_khr_fp64)
 DEFINE_NEG_KERNEL(double, double)
+#endif
 #ifdef USE_FP16
 #define cl_khr_fp16 1
 DEFINE_NEG_KERNEL(half, fp16)

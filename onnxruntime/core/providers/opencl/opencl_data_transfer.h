@@ -26,7 +26,6 @@ class OpenCLGPUDataTransfer : public IDataTransfer {
 
  private:
   const OpenCLExecutionProvider* exec_;
-  const OpenCLKernelHolder* kernels_;
 };
 
 

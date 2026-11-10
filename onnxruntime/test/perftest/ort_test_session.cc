@@ -244,7 +244,7 @@ OnnxRuntimeTestSession::OnnxRuntimeTestSession(Ort::Env& env, std::random_device
       }
       else if (key == "auto_tune") {
         if (value .size()== 1 && '0' <= value[0] && value[0] <= '9') {
-          auto_tuning_level = std::stol(value);
+          auto_tuning_level = static_cast<int>(std::stol(value));
         } else {
           ORT_THROW("[ERROR] [OpenCL] The value for the key 'enable_auto_tune' should be a boolean i.e. true or false. Default value is false.\n");
         }

@@ -64,11 +64,13 @@ DEFINE_OP_KERNEL(float, float, div, DIV_OP)
 DEFINE_OP_KERNEL(float, float, pow, POW_OP)
 
 // double type kernels
+#if defined(cl_khr_fp64)
 DEFINE_OP_KERNEL(double, double, add, ADD_OP)
 DEFINE_OP_KERNEL(double, double, sub, SUB_OP)
 DEFINE_OP_KERNEL(double, double, mul, MUL_OP)
 DEFINE_OP_KERNEL(double, double, div, DIV_OP)
 DEFINE_OP_KERNEL(double, double, pow, POW_OP)
+#endif
 
 // int type kernels
 DEFINE_OP_KERNEL(int, int, add, ADD_OP)
@@ -151,8 +153,10 @@ DEFINE_LOGICOP_KERNEL(float, float, greater, GREATER_OP)
 DEFINE_LOGICOP_KERNEL(float, float, equal, EQUAL_OP)
 
 // double type kernels for Greater and Equal
+#if defined(cl_khr_fp64)
 DEFINE_LOGICOP_KERNEL(double, double, greater, GREATER_OP)
 DEFINE_LOGICOP_KERNEL(double, double, equal, EQUAL_OP)
+#endif
 
 // int type kernels for Greater and Equal
 DEFINE_LOGICOP_KERNEL(int, int, greater, GREATER_OP)

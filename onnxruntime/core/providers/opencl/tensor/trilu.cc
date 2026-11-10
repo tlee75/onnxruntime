@@ -22,7 +22,9 @@ class Trilu : public OpenCLKernel {
     upper = (int)temp;
     LoadProgram(trilu_kernel_src, trilu_kernel_src_len);
     LoadKernel("Trilu_float");
-    LoadKernel("Trilu_double");
+    if (exec_->SupportsFp64()) {
+      LoadKernel("Trilu_double");
+    }
   };
 
   Status Compute(OpKernelContext* context) const override;
