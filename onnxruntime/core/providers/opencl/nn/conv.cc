@@ -67,6 +67,10 @@ class Conv : public OpenCLKernel {
       LoadKernel("Gemm_Tiled_Conv_BM32_H");
       LoadKernel("Gemm_Tiled_Conv_BM16_H");
       LoadKernel("Gemm_Tiled_Conv_BN32_H");
+      // The 1D Winograd F(4,3) path (see WinogradConv()).
+      LoadKernel("WinoWeightT");
+      LoadKernel("WinoInputT6");
+      LoadKernel("WinoOutputT");
     }
   }
 
@@ -148,6 +152,9 @@ class Conv : public OpenCLKernel {
                 .SetBuffer(x)
                 .SetBuffer(y)
                 .SetBuffer(bias)
+                .SetArg<cl_int>(0)  // sa/sb/sc: a plain (single-plane) GEMM
+                .SetArg<cl_int>(0)
+                .SetArg<cl_int>(0)
                 .Launch(*exec_, NDRange(gn_used * lx, gm * ly), NDRange(lx, ly)));
       } else {
         // General conv: fuse im2col into the GEMM.
@@ -164,12 +171,24 @@ class Conv : public OpenCLKernel {
         // asked for it (half the local memory => better occupancy, half2 MAC).
         const bool f16 = exec_->SupportsFp16() && exec_->UseFp16();
         const bool h = IsHalf(*X);
+        // 1D Winograd F(4,3) for any stride-1 k>=3 conv, decomposed into ceil(K/3)
+        // 3-tap slices stacked along the reduction (K=3 is one slice, K=7 is three);
+        // any pad works, slice s's window starts at 4j - pad + 3s. Half-storage
+        // only, so the fp32 path is untouched -- the fp16 graph's Convs are where
+        // this pays (docs/ORT_GPU_IMAGE2D_PROPOSAL.md section 8).
+        const bool wino = h && k_i >= 3 && stride == 1 && dilation == 1 &&
+                          (wout_i % 4) == 0 && m_i > 0 && c_i > 0;
+        if (wino) {
+          ORT_RETURN_IF_ERROR(WinogradConv(a, x, y, bias, m_i, wout_i, c_i, w_i, k_i,
+                                           static_cast<int>(pad_l), has_bias));
+          return Status::OK();
+        }
         const ConvTile tile = ChooseConvTile(m_i, wout_i, cap0, f16, h, a, x, y, bias,
                                              c_i, w_i, k_i, static_cast<int>(stride),
-                                             static_cast<int>(pad_l),
-                                             static_cast<int>(dilation), has_bias);
-        const size_t flx = tile.bn / kGemmTN;
-        const size_t fly = tile.bm / kGemmTM;
+                                             static_cast<int>(pad_l), static_cast<int>(dilation),
+                                             has_bias);
+        const size_t flx = tile.bn / static_cast<size_t>(kGemmTN);
+        const size_t fly = tile.bm / static_cast<size_t>(kGemmTM);
         const size_t fgm = (static_cast<size_t>(m_i) + tile.bm - 1) / tile.bm;
         const size_t fgn = (static_cast<size_t>(wout_i) + tile.bn - 1) / tile.bn;
         const size_t fgn_used = std::min(fgn, std::max<size_t>(1, cap0 / flx));
@@ -319,6 +338,118 @@ class Conv : public OpenCLKernel {
   // enableAutoTune: chosen fused-conv tile per (M, Wout, Kdim, fp16).
   mutable std::mutex tile_mu_;
   mutable std::map<std::array<int, 4>, std::array<size_t, 2>> tile_choice_;
+
+  /// The 1D F(4,3) path for any stride-1 k>=3
+  /// conv, as ceil(K/3) 3-tap slices stacked along the reduction (K=3 -> 1 slice,
+  /// K=7 -> 3). The transformed weights U depend only on the shape, so they are
+  /// built once and cached; V (input tiles) and P (transform-domain products) are
+  /// cached per (M, C, T, NS) and rebuilt each call. All six transform points live
+  /// in ONE U/V/P buffer (plane-stride apart) so the transform-domain GEMM is a
+  /// SINGLE 3-D launch -- its z range is the transform point -- instead of six
+  /// small ones. It reduces over NS*C instead of over C*K -- that is the win.
+  Status WinogradConv(cl_mem wt, cl_mem x, cl_mem y, cl_mem bias,
+                      int m_i, int wout_i, int c_i, int w_i, int k_i, int pad_l,
+                      int has_bias) const {
+    const int T = wout_i / 4;
+    // ceil(K/3) 3-tap slices, stacked along the reduction: the transform-domain
+    // GEMM then reduces over NS*C instead of over C*K.
+    const int NS = (k_i + 2) / 3;
+    const size_t nc = static_cast<size_t>(NS) * static_cast<size_t>(c_i);
+    const size_t u_stride = static_cast<size_t>(m_i) * nc;
+    const size_t v_stride = nc * static_cast<size_t>(T);
+    const size_t p_stride = static_cast<size_t>(m_i) * static_cast<size_t>(T);
+    const size_t u_sz = 6 * u_stride * sizeof(cl_half);
+    const size_t v_sz = 6 * v_stride * sizeof(cl_half);
+    const size_t p_sz = 6 * p_stride * sizeof(cl_half);
+    std::lock_guard<std::mutex> guard(wino_mu_);
+    if (wino_m_ != m_i || wino_c_ != c_i || wino_t_ != T || wino_ns_ != NS) {
+      if (wino_u_) clReleaseMemObject(wino_u_);
+      if (wino_v_) clReleaseMemObject(wino_v_);
+      if (wino_p_) clReleaseMemObject(wino_p_);
+      cl_int e1 = CL_SUCCESS, e2 = CL_SUCCESS, e3 = CL_SUCCESS;
+      wino_u_ = clCreateBuffer(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, u_sz, nullptr, &e1);
+      wino_v_ = clCreateBuffer(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, v_sz, nullptr, &e2);
+      wino_p_ = clCreateBuffer(exec_->GetOpenCLContext(), CL_MEM_READ_WRITE, p_sz, nullptr, &e3);
+      ORT_ENFORCE(e1 == CL_SUCCESS && e2 == CL_SUCCESS && e3 == CL_SUCCESS,
+                  "WinogradConv: scratch allocation failed");
+      wino_m_ = m_i;
+      wino_c_ = c_i;
+      wino_t_ = T;
+      wino_ns_ = NS;
+      for (int t = 0; t < 6; ++t) {
+        ORT_RETURN_IF_ERROR(
+            KernelLauncher{GetKernel("WinoWeightT")}
+                .SetBuffer(wt)
+                .SetArg<cl_int>(m_i)
+                .SetArg<cl_int>(c_i)
+                .SetArg<cl_int>(k_i)
+                .SetArg<cl_int>(NS)
+                .SetArg<cl_int>(t)
+                .SetArg<cl_int>(static_cast<cl_int>(u_stride))
+                .SetBuffer(wino_u_)
+                .Launch(*exec_, NDRange(nc, static_cast<size_t>(m_i))));
+      }
+    }
+    // All six transform points in ONE launch: each work-item reads its 6-tap
+    // window once and emits all six planes (docs/ORT_GPU_IMAGE2D_PROPOSAL.md §8).
+    ORT_RETURN_IF_ERROR(
+        KernelLauncher{GetKernel("WinoInputT6")}
+            .SetBuffer(x)
+            .SetArg<cl_int>(c_i)
+            .SetArg<cl_int>(w_i)
+            .SetArg<cl_int>(NS)
+            .SetArg<cl_int>(pad_l)
+            .SetArg<cl_int>(T)
+            .SetArg<cl_int>(static_cast<cl_int>(v_stride))
+            .SetBuffer(wino_v_)
+            .Launch(*exec_, NDRange(static_cast<size_t>(T), nc)));
+    const size_t lx = 16;  // Gemm_Tiled_F16H work-group: GEMM_BN / GEMM_TN
+    const size_t ly = 16;  //                             GEMM_BM / GEMM_TM
+    const size_t gn = (static_cast<size_t>(T) + 63) / 64;
+    const size_t gm = (static_cast<size_t>(m_i) + 63) / 64;
+    const size_t cap0 = exec_->MaxWorkItemSize(0);
+    const size_t gn_used = std::min(gn, std::max<size_t>(1, cap0 / lx));
+    ORT_RETURN_IF_ERROR(
+        KernelLauncher{GetKernel("Gemm_Tiled_F16H")}
+            .SetArg<cl_int>(m_i)
+            .SetArg<cl_int>(T)
+            .SetArg<cl_int>(static_cast<cl_int>(nc))
+            .SetArg<cl_int>(0)  // bias is applied by WinoOutputT
+            .SetArg<cl_int>(0)  // trans_a: U is [M, NC]
+            .SetBuffer(wino_u_)
+            .SetBuffer(wino_v_)
+            .SetBuffer(wino_p_)
+            .SetBuffer(bias)
+            .SetArg<cl_int>(static_cast<cl_int>(u_stride))
+            .SetArg<cl_int>(static_cast<cl_int>(v_stride))
+            .SetArg<cl_int>(static_cast<cl_int>(p_stride))
+            .Launch(*exec_, NDRange(gn_used * lx, gm * ly, 6), NDRange(lx, ly, 1)));
+    ORT_RETURN_IF_ERROR(
+        KernelLauncher{GetKernel("WinoOutputT")}
+            .SetBuffer(wino_p_)
+            .SetArg<cl_int>(static_cast<cl_int>(p_stride))
+            .SetArg<cl_int>(m_i)
+            .SetArg<cl_int>(T)
+            .SetArg<cl_int>(has_bias)
+            .SetBuffer(bias)
+            .SetBuffer(y)
+            .SetArg<cl_int>(wout_i)
+            .SetArg<cl_int>(1)  // os: a plain conv writes every element
+            .SetArg<cl_int>(0)  // r
+            .Launch(*exec_, NDRange(static_cast<size_t>(T), static_cast<size_t>(m_i))));
+    return Status::OK();
+  }
+
+  // Cached transform-domain tensors, six planes back to back per buffer, rebuilt
+  // when the shape changes and kept for the session (see WinogradConv()).
+  mutable std::mutex wino_mu_;
+  mutable cl_mem wino_u_ = nullptr;
+  mutable cl_mem wino_v_ = nullptr;
+  mutable cl_mem wino_p_ = nullptr;
+  mutable int wino_m_ = 0;
+  mutable int wino_c_ = 0;
+  mutable int wino_t_ = 0;
+  mutable int wino_ns_ = 0;
 };
 
 ONNX_OPENCL_OPERATOR_KERNEL(
