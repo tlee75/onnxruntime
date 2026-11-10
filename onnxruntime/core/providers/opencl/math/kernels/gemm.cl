@@ -50,7 +50,7 @@ __kernel void Gemm_Float(
 //
 // Two implementations, chosen by the EP's `use_fp16` flag (see the conv hosts):
 //   Gemm_Tiled      - fp32 local tiles, fp32 MAC + fp32 accumulate (default).
-//   Gemm_Tiled_F16  - half local tiles, packed half2 MAC, half2 accumulate.
+//   Gemm_Tiled_F16  - half local tiles, packed half2 MAC, fp32 accumulate.
 //
 // Both grid-stride over the N tiles: the grid is capped to the device's
 // CL_DEVICE_MAX_WORK_ITEM_SIZES[0] (Mali tolerates a huge per-dimension global
@@ -162,9 +162,11 @@ void Gemm_Tiled(
 #if defined(cl_khr_fp16)
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
-// fp16 variant: half local tiles, packed half2 MAC and half2 accumulate. The
-// half2 accumulator is converted to fp32 only when the result is stored, so the
-// whole reduction accumulates in fp16.
+// fp16 variant: half local tiles, packed half2 MAC, fp32 ACCUMULATE. The products
+// stay half (that is what halves the memory traffic); the running sum is float.
+// Accumulating the whole reduction in half was measured ~2.4x less accurate than
+// the fp32 reference for the vocoder, for no measurable speed gain -- see
+// docs/ORT_GPU_TODO.md, "fp16 arithmetic: storage vs accumulate".
 __kernel __attribute__((reqd_work_group_size(GEMM_BN / GEMM_TN, GEMM_BM / GEMM_TM, 1)))
 void Gemm_Tiled_F16(
     const int M,
@@ -203,10 +205,13 @@ void Gemm_Tiled_F16(
   for (int nt = get_group_id(0); nt < numNtiles; nt += get_num_groups(0)) {
     const int col0 = nt * GEMM_BN;
 
-    half2 acc2[GEMM_TM][GEMM_TN / 2];
+    // fp32 accumulate: the products stay half, the SUM is float. Accumulating the
+    // whole reduction in fp16 is what made the fp16 vocoder measurably less
+    // accurate than the fp32 reference (docs/ORT_GPU_TODO.md, "fp16 arithmetic").
+    float2 acc[GEMM_TM][GEMM_TN / 2];
     for (int i = 0; i < GEMM_TM; ++i)
       for (int j2 = 0; j2 < GEMM_TN / 2; ++j2)
-        acc2[i][j2] = (half2)(bias_r[i], bias_r[i]);
+        acc[i][j2] = (float2)((float)bias_r[i], (float)bias_r[i]);
 
     for (int k0 = 0; k0 < K; k0 += GEMM_BK) {
       for (int idx = tid; idx < GEMM_BM * GEMM_BK; idx += nthreads) {
@@ -226,13 +231,13 @@ void Gemm_Tiled_F16(
       barrier(CLK_LOCAL_MEM_FENCE);
 
       for (int kk = 0; kk < GEMM_BK; ++kk) {
-        half a[GEMM_TM];
-        for (int i = 0; i < GEMM_TM; ++i) a[i] = As[ly * GEMM_TM + i][kk];
+        float af[GEMM_TM];
+        for (int i = 0; i < GEMM_TM; ++i) af[i] = (float)As[ly * GEMM_TM + i][kk];
         for (int j2 = 0; j2 < GEMM_TN / 2; ++j2) {
           const int jc = lx * GEMM_TN + 2 * j2;
-          const half2 b2 = (half2)(Bs[kk][jc], Bs[kk][jc + 1]);
+          const float2 b2 = (float2)((float)Bs[kk][jc], (float)Bs[kk][jc + 1]);
           for (int i = 0; i < GEMM_TM; ++i)
-            acc2[i][j2] = (half2)(a[i], a[i]) * b2 + acc2[i][j2];
+            acc[i][j2] += (float2)(af[i], af[i]) * b2;
         }
       }
       barrier(CLK_LOCAL_MEM_FENCE);
@@ -243,15 +248,15 @@ void Gemm_Tiled_F16(
       if (gr >= M) continue;
       for (int j2 = 0; j2 < GEMM_TN / 2; ++j2) {
         const int gc = col0 + lx * GEMM_TN + 2 * j2;
-        if (gc < N) C[gr * N + gc] = (float)acc2[i][j2].lo;
-        if (gc + 1 < N) C[gr * N + gc + 1] = (float)acc2[i][j2].hi;
+        if (gc < N) C[gr * N + gc] = acc[i][j2].lo;
+        if (gc + 1 < N) C[gr * N + gc + 1] = acc[i][j2].hi;
       }
     }
     barrier(CLK_LOCAL_MEM_FENCE);
   }
 }
 
-// Same tiling and the same half2 accumulate as Gemm_Tiled_F16, but the operands
+// Same tiling and the same fp32 accumulate as Gemm_Tiled_F16, but the operands
 // and the result are half *in memory* -- the storage strategy of an fp16 graph
 // (and of LiteRT's GPU delegate). The fp32-storage F16 variant above converts each
 // element on load and on store; here the bytes moved are already half.
@@ -297,10 +302,13 @@ void Gemm_Tiled_F16H(
   for (int nt = get_group_id(0); nt < numNtiles; nt += get_num_groups(0)) {
     const int col0 = nt * GEMM_BN;
 
-    half2 acc2[GEMM_TM][GEMM_TN / 2];
+    // fp32 accumulate: the products stay half, the SUM is float. Accumulating the
+    // whole reduction in fp16 is what made the fp16 vocoder measurably less
+    // accurate than the fp32 reference (docs/ORT_GPU_TODO.md, "fp16 arithmetic").
+    float2 acc[GEMM_TM][GEMM_TN / 2];
     for (int i = 0; i < GEMM_TM; ++i)
       for (int j2 = 0; j2 < GEMM_TN / 2; ++j2)
-        acc2[i][j2] = (half2)(bias_r[i], bias_r[i]);
+        acc[i][j2] = (float2)((float)bias_r[i], (float)bias_r[i]);
 
     for (int k0 = 0; k0 < K; k0 += GEMM_BK) {
       // Packed half2 global loads where the addresses are structurally contiguous
@@ -390,13 +398,13 @@ void Gemm_Tiled_F16H(
       barrier(CLK_LOCAL_MEM_FENCE);
 
       for (int kk = 0; kk < GEMM_BK; ++kk) {
-        half a[GEMM_TM];
-        for (int i = 0; i < GEMM_TM; ++i) a[i] = As[ly * GEMM_TM + i][kk];
+        float af[GEMM_TM];
+        for (int i = 0; i < GEMM_TM; ++i) af[i] = (float)As[ly * GEMM_TM + i][kk];
         for (int j2 = 0; j2 < GEMM_TN / 2; ++j2) {
           const int jc = lx * GEMM_TN + 2 * j2;
-          const half2 b2 = (half2)(Bs[kk][jc], Bs[kk][jc + 1]);
+          const float2 b2 = (float2)((float)Bs[kk][jc], (float)Bs[kk][jc + 1]);
           for (int i = 0; i < GEMM_TM; ++i)
-            acc2[i][j2] = (half2)(a[i], a[i]) * b2 + acc2[i][j2];
+            acc[i][j2] += (float2)(af[i], af[i]) * b2;
         }
       }
       barrier(CLK_LOCAL_MEM_FENCE);
@@ -409,9 +417,9 @@ void Gemm_Tiled_F16H(
         for (int j2 = 0; j2 < GEMM_TN / 2; ++j2) {
           const int gc = col0 + lx * GEMM_TN + 2 * j2;
           if (gc + 1 < N) {
-            *(__global half2*)(C + gr * N + gc) = acc2[i][j2];
+            *(__global half2*)(C + gr * N + gc) = (half2)((half)acc[i][j2].lo, (half)acc[i][j2].hi);
           } else if (gc < N) {
-            C[gr * N + gc] = acc2[i][j2].lo;
+            C[gr * N + gc] = (half)acc[i][j2].lo;
           }
         }
       }
@@ -421,8 +429,8 @@ void Gemm_Tiled_F16H(
         if (gr >= M) continue;
         for (int j2 = 0; j2 < GEMM_TN / 2; ++j2) {
           const int gc = col0 + lx * GEMM_TN + 2 * j2;
-          if (gc < N) C[gr * N + gc] = acc2[i][j2].lo;
-          if (gc + 1 < N) C[gr * N + gc + 1] = acc2[i][j2].hi;
+          if (gc < N) C[gr * N + gc] = (half)acc[i][j2].lo;
+          if (gc + 1 < N) C[gr * N + gc + 1] = (half)acc[i][j2].hi;
         }
       }
     }

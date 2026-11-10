@@ -211,10 +211,10 @@ DEFINE_GEMM_TILED_CONV(Gemm_Tiled_Conv_BN32, 64, 32, 32, 4, 4)
     const int numNtiles = (Wout + BN - 1) / BN;                                 \
     for (int nt = get_group_id(0); nt < numNtiles; nt += get_num_groups(0)) {   \
       const int col0 = nt * BN;                                                 \
-      half2 acc2[TM][TN / 2];                                                    \
+      float2 acc[TM][TN / 2];                                                    \
       for (int i = 0; i < TM; ++i)                                              \
         for (int j2 = 0; j2 < TN / 2; ++j2)                                     \
-          acc2[i][j2] = (half2)(bias_r[i], bias_r[i]);                          \
+          acc[i][j2] = (float2)((float)bias_r[i], (float)bias_r[i]);                          \
       for (int k0 = 0; k0 < Kdim; k0 += BK) {                                   \
         for (int idx = tid; idx < BM * BK; idx += nthreads) {                   \
           const int i = idx / BK;                                               \
@@ -239,13 +239,13 @@ DEFINE_GEMM_TILED_CONV(Gemm_Tiled_Conv_BN32, 64, 32, 32, 4, 4)
         }                                                                       \
         barrier(CLK_LOCAL_MEM_FENCE);                                           \
         for (int kk = 0; kk < BK; ++kk) {                                       \
-          half a[TM];                                                           \
-          for (int i = 0; i < TM; ++i) a[i] = As[ly * TM + i][kk];              \
+          float af[TM];                                                           \
+          for (int i = 0; i < TM; ++i) af[i] = (float)As[ly * TM + i][kk];              \
           for (int j2 = 0; j2 < TN / 2; ++j2) {                                 \
             const int jc = lx * TN + 2 * j2;                                    \
-            const half2 b2 = (half2)(Bs[kk][jc], Bs[kk][jc + 1]);               \
+            const float2 b2 = (float2)((float)Bs[kk][jc], (float)Bs[kk][jc + 1]);               \
             for (int i = 0; i < TM; ++i)                                        \
-              acc2[i][j2] = (half2)(a[i], a[i]) * b2 + acc2[i][j2];             \
+              acc[i][j2] += (float2)(af[i], af[i]) * b2;             \
           }                                                                     \
         }                                                                       \
         barrier(CLK_LOCAL_MEM_FENCE);                                           \
@@ -255,8 +255,8 @@ DEFINE_GEMM_TILED_CONV(Gemm_Tiled_Conv_BN32, 64, 32, 32, 4, 4)
         if (gr >= M) continue;                                                  \
         for (int j2 = 0; j2 < TN / 2; ++j2) {                                   \
           const int gc = col0 + lx * TN + 2 * j2;                               \
-          if (gc < Wout) Y[gr * Wout + gc] = (float)acc2[i][j2].lo;             \
-          if (gc + 1 < Wout) Y[gr * Wout + gc + 1] = (float)acc2[i][j2].hi;     \
+          if (gc < Wout) Y[gr * Wout + gc] = acc[i][j2].lo;             \
+          if (gc + 1 < Wout) Y[gr * Wout + gc + 1] = acc[i][j2].hi;     \
         }                                                                       \
       }                                                                         \
       barrier(CLK_LOCAL_MEM_FENCE);                                             \
@@ -268,7 +268,7 @@ DEFINE_GEMM_TILED_CONV_F16(Gemm_Tiled_Conv_BM32_F16, 32, 64, 32, 4, 4)
 DEFINE_GEMM_TILED_CONV_F16(Gemm_Tiled_Conv_BM16_F16, 16, 64, 32, 4, 4)
 DEFINE_GEMM_TILED_CONV_F16(Gemm_Tiled_Conv_BN32_F16, 64, 32, 32, 4, 4)
 
-// Half-*storage* twins: same tiles and half2 accumulate, but Wt/X/Y/B are half in
+// Half-*storage* twins: same tiles and fp32 accumulate, but Wt/X/Y/B are half in
 // memory -- what an fp16 graph (and the GPU delegate) actually hands us. The F16
 // family above keeps fp32 storage and converts per element on load and store.
 #define DEFINE_GEMM_TILED_CONV_H(NAME, BM, BN, BK, TM, TN)                    \
@@ -294,10 +294,10 @@ DEFINE_GEMM_TILED_CONV_F16(Gemm_Tiled_Conv_BN32_F16, 64, 32, 32, 4, 4)
     const int numNtiles = (Wout + BN - 1) / BN;                                 \
     for (int nt = get_group_id(0); nt < numNtiles; nt += get_num_groups(0)) {   \
       const int col0 = nt * BN;                                                 \
-      half2 acc2[TM][TN / 2];                                                    \
+      float2 acc[TM][TN / 2];                                                    \
       for (int i = 0; i < TM; ++i)                                              \
         for (int j2 = 0; j2 < TN / 2; ++j2)                                     \
-          acc2[i][j2] = (half2)(bias_r[i], bias_r[i]);                          \
+          acc[i][j2] = (float2)((float)bias_r[i], (float)bias_r[i]);                          \
       for (int k0 = 0; k0 < Kdim; k0 += BK) {                                   \
         if ((((size_t)Wt) & 3) == 0 && (Kdim & 1) == 0) {                      \
           for (int idx = tid; idx < BM * (BK / 2); idx += nthreads) {           \
@@ -339,13 +339,13 @@ DEFINE_GEMM_TILED_CONV_F16(Gemm_Tiled_Conv_BN32_F16, 64, 32, 32, 4, 4)
         }                                                                       \
         barrier(CLK_LOCAL_MEM_FENCE);                                           \
         for (int kk = 0; kk < BK; ++kk) {                                       \
-          half a[TM];                                                           \
-          for (int i = 0; i < TM; ++i) a[i] = As[ly * TM + i][kk];              \
+          float af[TM];                                                           \
+          for (int i = 0; i < TM; ++i) af[i] = (float)As[ly * TM + i][kk];              \
           for (int j2 = 0; j2 < TN / 2; ++j2) {                                 \
             const int jc = lx * TN + 2 * j2;                                    \
-            const half2 b2 = (half2)(Bs[kk][jc], Bs[kk][jc + 1]);              \
+            const float2 b2 = (float2)((float)Bs[kk][jc], (float)Bs[kk][jc + 1]); \
             for (int i = 0; i < TM; ++i)                                        \
-              acc2[i][j2] = (half2)(a[i], a[i]) * b2 + acc2[i][j2];             \
+              acc[i][j2] += (float2)(af[i], af[i]) * b2;             \
           }                                                                     \
         }                                                                       \
         barrier(CLK_LOCAL_MEM_FENCE);                                           \
@@ -357,9 +357,9 @@ DEFINE_GEMM_TILED_CONV_F16(Gemm_Tiled_Conv_BN32_F16, 64, 32, 32, 4, 4)
           for (int j2 = 0; j2 < TN / 2; ++j2) {                                 \
             const int gc = col0 + lx * TN + 2 * j2;                             \
             if (gc + 1 < Wout) {                                                \
-              *(__global half2*)(Y + gr * Wout + gc) = acc2[i][j2];             \
+              *(__global half2*)(Y + gr * Wout + gc) = (half2)((half)acc[i][j2].lo, (half)acc[i][j2].hi);             \
             } else if (gc < Wout) {                                             \
-              Y[gr * Wout + gc] = acc2[i][j2].lo;                               \
+              Y[gr * Wout + gc] = (half)acc[i][j2].lo;                               \
             }                                                                   \
           }                                                                     \
         }                                                                       \
@@ -369,8 +369,8 @@ DEFINE_GEMM_TILED_CONV_F16(Gemm_Tiled_Conv_BN32_F16, 64, 32, 32, 4, 4)
           if (gr >= M) continue;                                                \
           for (int j2 = 0; j2 < TN / 2; ++j2) {                                 \
             const int gc = col0 + lx * TN + 2 * j2;                             \
-            if (gc < Wout) Y[gr * Wout + gc] = acc2[i][j2].lo;             \
-            if (gc + 1 < Wout) Y[gr * Wout + gc + 1] = acc2[i][j2].hi;     \
+            if (gc < Wout) Y[gr * Wout + gc] = (half)acc[i][j2].lo;             \
+            if (gc + 1 < Wout) Y[gr * Wout + gc + 1] = (half)acc[i][j2].hi;     \
           }                                                                     \
         }                                                                       \
       }                                                                         \
