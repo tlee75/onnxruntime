@@ -74,6 +74,20 @@ class Conv : public OpenCLKernel {
     }
   }
 
+  // Release the cached Winograd scratch buffers (see the members below). Unlike
+  // the session tensors -- owned by OpenCLBufferAllocator -- these are created
+  // directly from the context below and are NOT registered with the EP's scratch
+  // pool, so nothing else frees them. They are otherwise only released when
+  // reallocated for a new shape, so every kernel destruction leaked them, and
+  // with it the cl_context's device memory (~650 MB per GPU session). The base
+  // ~OpenCLKernelHolder runs after this and releases the programs/kernels; the
+  // context outlives both (the EP owns it).
+  ~Conv() override {
+    if (wino_u_) clReleaseMemObject(wino_u_);
+    if (wino_v_) clReleaseMemObject(wino_v_);
+    if (wino_p_) clReleaseMemObject(wino_p_);
+  }
+
   // The GEMM kernel to use: the fp16 variant when the device supports it AND the
   // session asked for fp16 (addOpenCL(useFp16, …)); otherwise the fp32 one.
   const char* GemmKernel(bool h) const {

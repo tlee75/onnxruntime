@@ -63,6 +63,27 @@ class ConvTranspose : public OpenCLKernel {
     }
   }
 
+  // Release the cached per-phase Winograd scratch buffers (see the members
+  // below). Created directly from the context and NOT registered with the EP's
+  // scratch pool, so nothing else frees them; without this every kernel
+  // destruction leaked them and the cl_context's device memory (~650 MB per GPU
+  // session). See Conv's destructor. The base ~OpenCLKernelHolder runs after
+  // this; the context outlives both (the EP owns it).
+  ~ConvTranspose() override {
+    for (cl_mem b : ct_u_) {
+      if (b) clReleaseMemObject(b);
+    }
+    for (cl_mem b : ct_v_) {
+      if (b) clReleaseMemObject(b);
+    }
+    for (cl_mem b : ct_p_) {
+      if (b) clReleaseMemObject(b);
+    }
+    for (cl_mem b : ct_wp_) {
+      if (b) clReleaseMemObject(b);
+    }
+  }
+
   // See Conv::GemmKernel: fp16 only when the device supports it AND the session
   // asked for fp16.
   const char* GemmKernel(bool h) const {

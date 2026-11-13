@@ -196,3 +196,6 @@ Package.resolved
 .build/
 .swiftpm/
 repros/
+
+# Build scratch (vcpkg/CMake/opencl-headers) — never commit
+.tmp/
